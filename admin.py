@@ -1,15 +1,20 @@
 """
 admin.py — AES_ai Flask Application (Production-Grade + Parallel Evaluation)
 =============================================================================
-FIXES IN THIS VERSION:
-  1. MYSQL_PORT changed back to 3306 (XAMPP default — 3307 was causing MySQL crash)
-  2. delete_student_score now redirects back to the student's score page, not admin_students
-  3. submit_answers (legacy alias) calls redirect instead of directly calling the view function
-     to prevent double-commit on back-button resubmit
-  4. add_student / add_teacher guard against duplicate username (catches IntegrityError)
-  5. Cursor always closed in finally blocks in critical routes to prevent connection leaks
-  6. teacher_view_score defaultdict converted to plain dict before passing to template
-     (Jinja2 can't iterate defaultdict reliably in all versions)
+CHANGES IN THIS VERSION (evaluation pipeline upgrade):
+  1. evaluate_answer() now passes question_id to ai_evaluate_safe() so that
+     expected-answer embeddings are precomputed once per question and reused
+     for every student — eliminates redundant MiniLM encoding.
+  2. evaluate_answers_parallel() passes question_id from each work-list item
+     through to the evaluator.
+  3. All other routes and logic unchanged from previous version.
+
+Previous fixes retained:
+  - MYSQL_PORT = 3306 (XAMPP default)
+  - delete_student_score redirects to student's score page
+  - submit_answers uses redirect (prevents double-commit on back-navigation)
+  - add_student / add_teacher guard against duplicate usernames
+  - teacher_view_score uses plain dict (not defaultdict) for Jinja2 safety
 """
 
 import os
@@ -42,11 +47,14 @@ mysql = MySQL(app)
 # HELPER — CENTRAL EVALUATION CALL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate_answer(expected: str, student: str, question_text: str = "") -> dict:
+def evaluate_answer(expected: str, student: str,
+                    question_text: str = "",
+                    question_id: int = None) -> dict:
     """
-    Evaluate a student's answer.
-    - expected may be empty — handled gracefully via Gemini or heuristics.
-    - question_text is passed so Gemini has context when expected is absent.
+    Evaluate a student answer.
+    Passes question_id to ai_evaluate_safe so the expected-answer embedding
+    is computed once and cached — all subsequent students answering the same
+    question skip the MiniLM encode step entirely.
     """
     expected = (expected or "").strip()
     student  = (student  or "").strip()
@@ -61,7 +69,9 @@ def evaluate_answer(expected: str, student: str, question_text: str = "") -> dic
             "breakdown":          {},
         }
 
-    return ai_evaluate_safe(expected, student, question_text=qt)
+    return ai_evaluate_safe(expected, student,
+                            question_text=qt,
+                            question_id=question_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -92,6 +102,7 @@ def evaluate_answers_parallel(answers_list: list) -> dict:
             item["expected_answer"],
             item["student_answer"],
             item["question_text"],
+            question_id=item["question_id"],   # enables embedding cache
         )
         return item["question_id"], result
 
