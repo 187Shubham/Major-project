@@ -1,3 +1,9 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
+.env
+*.env
+instance/
+.DS_Store
+*.sqlite3

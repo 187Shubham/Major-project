@@ -98,6 +98,12 @@
     </div>
 
     <!-- Stats -->
+    {% set ns = namespace(evaluated=0) %}
+    {% for student in students %}
+        {% if student|length > 3 and student[3] > 0 %}
+            {% set ns.evaluated = ns.evaluated + 1 %}
+        {% endif %}
+    {% endfor %}
     <div class="stats-row">
         <div class="stat-card">
             <div class="label">Total Students</div>
@@ -105,7 +111,7 @@
         </div>
         <div class="stat-card">
             <div class="label">Evaluated Students</div>
-            <div class="value">{{ students|selectattr(3, 'gt', 0)|list|length }}</div>
+            <div class="value">{{ ns.evaluated }}</div>
         </div>
     </div>
 

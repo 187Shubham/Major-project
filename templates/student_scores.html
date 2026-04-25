@@ -3,110 +3,249 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Student Scores</title>
-    <!-- Bootstrap CSS -->
+    <title>Student Scores — Admin</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        body { background: #111827; color: #e5e7eb; }
+        .navbar { background: #1f2937 !important; }
+        .navbar-brand, .nav-link { color: #d1d5db !important; }
+        .nav-link:hover { color: #a78bfa !important; }
+
+        .page-header {
+            background: linear-gradient(135deg, #1f2937, #111827);
+            border-left: 4px solid #7c3aed;
+            border-radius: 8px;
+            padding: 16px 22px;
+            margin: 24px 0 20px;
+        }
+        .page-header h2 { margin: 0; font-size: 1.4rem; }
+
+        /* Test group card */
+        .test-group {
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 10px;
+            margin-bottom: 24px;
+            overflow: hidden;
+        }
+        .test-group-header {
+            background: #111827;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #374151;
+        }
+        .test-group-header h5 { margin: 0; color: #e2e8f0; font-size: 1rem; }
+
+        .score-badge {
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .badge-hi  { background: #065f46; color: #6ee7b7; }
+        .badge-mid { background: #78350f; color: #fcd34d; }
+        .badge-lo  { background: #450a0a; color: #fca5a5; }
+
+        /* Question rows */
+        .q-row {
+            padding: 16px 20px;
+            border-bottom: 1px solid #374151;
+        }
+        .q-row:last-child { border-bottom: none; }
+        .q-num { font-size: 0.68rem; color: #a78bfa; text-transform: uppercase;
+                 letter-spacing: 1px; font-weight: 700; margin-bottom: 6px; }
+        .q-text { color: #d1d5db; font-size: 0.95rem; font-weight: 500; margin-bottom: 12px; }
+
+        .answer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+        @media(max-width:600px){ .answer-grid { grid-template-columns: 1fr; } }
+
+        .ans-block { border-radius: 8px; padding: 10px 14px; font-size: 0.84rem; }
+        .ans-expected { background: #0c2240; border: 1px solid #1e3a5f; }
+        .ans-student  { background: #13112a; border: 1px solid #2d2060; }
+        .ans-label { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 1px;
+                     font-weight: 700; margin-bottom: 5px; }
+        .lbl-exp { color: #60a5fa; }
+        .lbl-stu { color: #a78bfa; }
+        .ans-text { color: #c4d0e0; line-height: 1.5; }
+
+        .score-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+        .sc-circle { width: 42px; height: 42px; border-radius: 50%; display: flex;
+                     align-items: center; justify-content: center;
+                     font-weight: 800; font-size: 1rem; flex-shrink: 0; }
+        .sc-10  { background: #064e3b; color: #6ee7b7; border: 2px solid #10b981; }
+        .sc-hi  { background: #064e3b; color: #6ee7b7; }
+        .sc-md  { background: #451a03; color: #fcd34d; }
+        .sc-lo  { background: #450a0a; color: #fca5a5; }
+        .sc-0   { background: #1f2937; color: #6b7280; border: 1px solid #374151; }
+
+        .feedback-block {
+            background: #0d1120;
+            border: 1px solid #2a3245;
+            border-radius: 7px;
+            padding: 9px 14px;
+            font-size: 0.82rem;
+            color: #94a3b8;
+            line-height: 1.5;
+        }
+        .fb-label { font-size: 0.64rem; color: #a78bfa; text-transform: uppercase;
+                    letter-spacing: 1px; font-weight: 700; margin-bottom: 4px; }
+
+        .no-expected-tag {
+            display: inline-block;
+            font-size: 0.68rem;
+            color: #f59e0b;
+            background: #451a03;
+            border: 1px solid #78350f;
+            border-radius: 4px;
+            padding: 1px 7px;
+            margin-left: 6px;
+        }
+
+        .btn-del { background: #b91c1c; border: none; color: #fff;
+                   padding: 4px 12px; border-radius: 6px; font-size: 0.78rem; }
+        .btn-del:hover { background: #dc2626; }
+
+        .btn-back { background: #1f2937; border: 1px solid #374151; color: #9ca3af;
+                    padding: 7px 18px; border-radius: 7px; text-decoration: none;
+                    font-size: 0.88rem; display: inline-block; margin-top: 12px; }
+        .btn-back:hover { color: #e2e8f0; text-decoration: none; }
+    </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
-        <!-- Change navbar-light to navbar-dark and bg-light to bg-dark -->
-        <div class="container">
-            <a class="navbar-brand" href="{{ url_for('admin_home') }}">Admin Panel</a>
-            <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarSupportedContent">
-                <ul class="navbar-nav ml-auto">
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('admin_home') }}">Home</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('admin_teachers') }}">Teachers</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('admin_students') }}">Students</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('admin_logout') }}">Logout</a>
-                    </li>
-                </ul>
-            </div>
+
+<nav class="navbar navbar-expand-lg navbar-dark">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="{{ url_for('admin_home') }}">Admin Panel</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarNav">
+            <ul class="navbar-nav ml-auto">
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_home') }}">Home</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_teachers') }}">Teachers</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_students') }}">Students</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_logout') }}">Logout</a></li>
+            </ul>
         </div>
-    </nav>
+    </div>
+</nav>
 
-    <div class="container mt-5">
-        <h2>Student Scores</h2>
-        <div class="row">
-            {% for test_id, test_scores in scores|groupby('test_id') %}
-            <div class="col-md-6 mb-4">
-                <div class="card bg-dark text-light">
-                    <div class="card-header">
-                        <h5 class="card-title">{{ test_scores[0]['test_name'] }}</h5>
-                    </div>
-                    <div class="card-body">
-                        <p class="card-text">
-                            Total Score: {{ test_scores|sum(attribute='score') }}
-                        </p>
-                        <button type="button" class="btn btn-primary" data-toggle="modal" data-target="#modal-{{ test_id }}">
-                            View Details
-                        </button>
-                    </div>
-                </div>
-            </div>
+<div class="container-fluid px-4">
 
-            <!-- Modal -->
-            <div class="modal fade" id="modal-{{ test_id }}" tabindex="-1" role="dialog" aria-labelledby="modal-{{ test_id }}-label" aria-hidden="true">
-                <div class="modal-dialog modal-lg" role="document">
-                    <div class="modal-content">
-                        <div class="modal-header">
-                            <h5 class="modal-title" id="modal-{{ test_id }}-label">{{ test_scores[0]['test_name'] }}</h5>
-                            <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-                                <span aria-hidden="true">&times;</span>
-                            </button>
-                        </div>
-                        <div class="modal-body">
-                            <table class="table table-striped">
-                                <thead>
-                                    <tr>
-                                        <th>Question</th>
-                                        <th>Expected Answer</th>
-                                        <th>Student Answer</th>
-                                        <th>Score</th>
-                                        <th>Delete</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {% for score in test_scores %}
-                                    <tr class="bg-dark text-light">
-                                        <td>{{ score['question_text'] }}</td>
-                                        <td>{{ score['expected_answer'] }}</td>
-                                        <td>{{ score['student_answer'] }}</td>
-                                        <td>{{ score['score'] }}</td>
-                                        <td>
-                                            <form action="{{ url_for('delete_student_score', answer_id=score['answer_id']) }}" method="post">
-                                                <button type="submit" class="btn btn-danger btn-sm">Delete</button>
-                                            </form>
-                                        </td>
-                                    </tr>
-                                    {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-                        <div class="modal-footer">
-                            <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-
-        <a href="{{ url_for('admin_home') }}" class="btn btn-primary">Back to Dashboard</a>
+    <div class="page-header">
+        <h2>📊 Student Score Details</h2>
     </div>
 
-    <!-- Bootstrap JS -->
-    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.4/dist/umd/popper.min.js"></script>
-    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+    {% if scores %}
+
+        {# Group scores by test_id using a dict in backend-safe way #}
+        {% set tests_seen = namespace(ids=[]) %}
+
+        {% for score in scores %}
+            {% if score.test_id not in tests_seen.ids %}
+                {% set _ = tests_seen.ids.append(score.test_id) %}
+
+                {# Collect all items for this test #}
+                {% set test_items = scores | selectattr('test_id', 'equalto', score.test_id) | list %}
+                {% set total = test_items | sum(attribute='score') %}
+                {% set max_score = test_items | length * 10 %}
+                {% set pct = (total / max_score * 100) | int if max_score > 0 else 0 %}
+
+                <div class="test-group">
+                    <div class="test-group-header">
+                        <h5>📋 {{ score.test_name }}</h5>
+                        <span class="score-badge
+                            {% if pct >= 70 %}badge-hi
+                            {% elif pct >= 40 %}badge-mid
+                            {% else %}badge-lo{% endif %}">
+                            {{ total }} / {{ max_score }} ({{ pct }}%)
+                        </span>
+                    </div>
+
+                    {% for item in test_items %}
+                        {% set s = item.score %}
+                        {% if s == 10 %}
+                            {% set sc_cls = "sc-10" %}
+                        {% elif s >= 7 %}
+                            {% set sc_cls = "sc-hi" %}
+                        {% elif s >= 4 %}
+                            {% set sc_cls = "sc-md" %}
+                        {% elif s >= 1 %}
+                            {% set sc_cls = "sc-lo" %}
+                        {% else %}
+                            {% set sc_cls = "sc-0" %}
+                        {% endif %}
+
+                    <div class="q-row">
+                        <div class="q-num">
+                            Question {{ loop.index }}
+                            {% if not item.expected_answer %}
+                                <span class="no-expected-tag">AI-only evaluation</span>
+                            {% endif %}
+                        </div>
+                        <div class="q-text">{{ item.question_text }}</div>
+
+                        <div class="answer-grid">
+                            <div class="ans-block ans-expected">
+                                <div class="ans-label lbl-exp">📚 Expected Answer</div>
+                                <div class="ans-text">
+                                    {% if item.expected_answer %}
+                                        {{ item.expected_answer }}
+                                    {% else %}
+                                        <em style="color:#6b7280;">No expected answer — evaluated by AI knowledge</em>
+                                    {% endif %}
+                                </div>
+                            </div>
+                            <div class="ans-block ans-student">
+                                <div class="ans-label lbl-stu">✏️ Student Answer</div>
+                                <div class="ans-text">
+                                    {% if item.student_answer %}
+                                        {{ item.student_answer }}
+                                    {% else %}
+                                        <em style="color:#6b7280;">No answer submitted</em>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="score-row">
+                            <span class="sc-circle {{ sc_cls }}">{{ s }}</span>
+                            <span style="color:#9ca3af; font-size:0.82rem;">Score: {{ s }} / 10</span>
+                            <form action="{{ url_for('delete_student_score', answer_id=item.answer_id) }}"
+                                  method="post" style="display:inline; margin-left:auto;">
+                                <button type="submit" class="btn-del"
+                                        onclick="return confirm('Delete this answer record?')">Delete</button>
+                            </form>
+                        </div>
+
+                        {% if item.feedback %}
+                        <div class="feedback-block">
+                            <div class="fb-label">🤖 AI Feedback</div>
+                            {{ item.feedback }}
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+
+                </div>
+            {% endif %}
+        {% endfor %}
+
+    {% else %}
+        <div style="text-align:center; padding:60px 20px; color:#6b7280;">
+            <div style="font-size:3rem; margin-bottom:12px;">📭</div>
+            <h5 style="color:#9ca3af;">No score records found for this student.</h5>
+        </div>
+    {% endif %}
+
+    <a href="{{ url_for('admin_students') }}" class="btn-back">← Back to Students</a>
+
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.4/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
 </body>
 </html>

@@ -1,10 +1,16 @@
 """
-ai_evaluator.py
----------------
-Hybrid evaluation engine — 9 NLP techniques weighted blend.
-PRIMARY:   Google Gemini 1.5 Flash (semantic understanding only)
-FALLBACK:  Full local 9-technique pipeline
-Score range: 0–10 (always partial, never binary)
+ai_evaluator.py — Production-Grade Answer Evaluator
+=====================================================
+PRIMARY:  Google Gemini 1.5 Flash (semantic evaluation + feedback)
+FALLBACK: 7-technique local NLP pipeline
+Features:
+  - Handles questions WITH or WITHOUT expected answers
+  - Proper normalisation (case, spaces, punctuation)
+  - Meaningful, explainable feedback (not generic)
+  - In-memory cache (thread-safe)
+  - Timeout-guarded Gemini calls
+  - Auto-generate expected answers via Gemini
+  - Score range 0–10, realistically distributed
 """
 
 import os
@@ -13,18 +19,21 @@ import json
 import hashlib
 import time
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = "gemini-1.5-flash"
 MAX_RETRIES    = 2
 RETRY_DELAY    = 1
+GEMINI_TIMEOUT = 10   # seconds before falling back to local
 
-# ── In-memory cache ───────────────────────────────────────────────────────────
+# ── Thread-safe in-memory cache ─────────────────────────────────────────────────
 _eval_cache: dict = {}
+_cache_lock = threading.Lock()
 
 def _cache_key(expected: str, student: str) -> str:
     combined = f"{expected.strip().lower()}|||{student.strip().lower()}"
@@ -32,45 +41,94 @@ def _cache_key(expected: str, student: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 1 — EXACT MATCH (5%)
+# TEXT NORMALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _exact_match(expected: str, student: str) -> float:
-    """Returns 1.0 if exact match, 0.0 otherwise."""
-    return 1.0 if expected.strip().lower() == student.strip().lower() else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 2 — KEYWORD MATCH (12%)
-# ══════════════════════════════════════════════════════════════════════════════
+def normalise(text: str) -> str:
+    """Lowercase, collapse whitespace, strip punctuation."""
+    text = text.lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s]", "", text)
+    return text
 
 STOPWORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "through", "and",
-    "or", "but", "not", "this", "that", "it", "its", "i", "we", "you",
-    "he", "she", "they", "which", "who", "what", "when", "where", "how",
-    "also", "so", "if", "then", "than", "about", "up", "out", "use"
+    "a","an","the","is","are","was","were","be","been","being","have","has",
+    "had","do","does","did","will","would","could","should","may","might",
+    "shall","can","to","of","in","for","on","with","at","by","from","as",
+    "into","through","and","or","but","not","this","that","it","its","i",
+    "we","you","he","she","they","which","who","what","when","where","how",
+    "also","so","if","then","than","about","up","out","use","our","their",
+    "there","here","just","very","much","more","some","any","all","each",
+    "both","few","those","these","such","only","same","than","too","very",
 }
 
 def _tokens(text: str) -> set:
+    """Extract meaningful tokens, remove stopwords."""
     return {w for w in re.findall(r"[a-z]+", text.lower())
             if w not in STOPWORDS and len(w) > 2}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GEMINI — AUTO GENERATE EXPECTED ANSWER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_expected_answer(question_text: str) -> str:
+    """
+    Call Gemini to generate a correct expected answer for a question.
+    Returns empty string on failure.
+    """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set — cannot auto-generate answer.")
+        return ""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = (
+            "You are an academic subject matter expert. "
+            "Provide a comprehensive, accurate expected answer for this question. "
+            "Cover all key concepts in 2–4 clear sentences. "
+            "Do NOT include preamble, just the answer itself.\n\n"
+            f"Question: {question_text}"
+        )
+        response = model.generate_content(
+            prompt,
+            generation_config={"temperature": 0.3, "max_output_tokens": 350}
+        )
+        answer = response.text.strip()
+        logger.info("Gemini generated expected answer for: %s", question_text[:60])
+        return answer
+    except Exception as e:
+        logger.error("Gemini answer generation failed: %s", e)
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TECHNIQUE 1 — NORMALISED EXACT MATCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _exact_match(expected: str, student: str) -> float:
+    return 1.0 if normalise(expected) == normalise(student) else 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TECHNIQUE 2 — KEYWORD MATCH WITH LENGTH PENALTY
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _keyword_match(expected: str, student: str) -> float:
     exp_words = _tokens(expected)
     stu_words = _tokens(student)
     if not exp_words:
-        return 0.0
+        return 0.5   # no reference — neutral
     overlap = len(exp_words & stu_words) / len(exp_words)
-    # Penalize very short student answers
-    length_ratio = min(1.0, len(student.split()) / max(1, len(expected.split())))
-    return overlap * 0.75 + length_ratio * 0.25
+    exp_len = len(expected.split())
+    stu_len = len(student.split())
+    length_ratio = min(1.0, stu_len / max(1, exp_len))
+    return overlap * 0.80 + length_ratio * 0.20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 3 — TF-IDF COSINE SIMILARITY (12%)
+# TECHNIQUE 3 — TF-IDF COSINE SIMILARITY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tfidf_cosine(expected: str, student: str) -> float:
@@ -82,60 +140,29 @@ def _tfidf_cosine(expected: str, student: str) -> float:
         return float(cosine_similarity(mat[0], mat[1])[0][0])
     except Exception as e:
         logger.warning("TF-IDF failed: %s", e)
-        return 0.0
+        return _keyword_match(expected, student) * 0.85
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 4 — SENTIMENT ANALYSIS (3%)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _sentiment_similarity(expected: str, student: str) -> float:
-    """Checks if sentiment polarity direction matches."""
-    try:
-        from nltk.sentiment import SentimentIntensityAnalyzer
-        import nltk
-        try:
-            nltk.data.find('sentiment/vader_lexicon.zip')
-        except LookupError:
-            nltk.download('vader_lexicon', quiet=True)
-        sia = SentimentIntensityAnalyzer()
-        exp_score = sia.polarity_scores(expected)['compound']
-        stu_score = sia.polarity_scores(student)['compound']
-        # Normalize: both positive, both negative, both neutral → higher score
-        diff = abs(exp_score - stu_score)
-        return max(0.0, 1.0 - diff)
-    except Exception as e:
-        logger.warning("Sentiment analysis failed: %s", e)
-        # Fallback: basic positive/negative word ratio comparison
-        pos_words = {"good", "correct", "right", "true", "yes", "positive", "increase", "improve"}
-        neg_words = {"bad", "wrong", "false", "no", "negative", "decrease", "reduce", "not"}
-        def polarity(text):
-            words = set(text.lower().split())
-            return len(words & pos_words) - len(words & neg_words)
-        exp_pol = polarity(expected)
-        stu_pol = polarity(student)
-        if exp_pol == 0 and stu_pol == 0:
-            return 0.7
-        if (exp_pol > 0 and stu_pol > 0) or (exp_pol < 0 and stu_pol < 0):
-            return 0.8
-        return 0.3
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 5 — SEMANTIC SIMILARITY via sentence-transformers (18%)
+# TECHNIQUE 4 — SENTENCE TRANSFORMER SEMANTIC SIMILARITY
 # ══════════════════════════════════════════════════════════════════════════════
 
 _st_model = None
+_st_lock  = threading.Lock()
 
 def _get_st_model():
     global _st_model
     if _st_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _st_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
-        except Exception as e:
-            logger.warning("SentenceTransformer load failed: %s", e)
-    return _st_model
+        with _st_lock:
+            if _st_model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    _st_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+                    logger.info("SentenceTransformer loaded.")
+                except Exception as e:
+                    logger.warning("SentenceTransformer load failed: %s", e)
+                    _st_model = "FAILED"
+    return None if _st_model == "FAILED" else _st_model
 
 def _semantic_similarity(expected: str, student: str) -> float:
     try:
@@ -152,407 +179,673 @@ def _semantic_similarity(expected: str, student: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 6 — NAIVE BAYES (8%)
+# TECHNIQUE 5 — GEMINI SEMANTIC EVALUATION
+# Runs in a thread with strict timeout so it never hangs the request
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _naive_bayes_score(expected: str, student: str) -> float:
-    try:
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.naive_bayes import MultinomialNB
-        import numpy as np
-        # Create a small corpus: expected is class 0 (reference),
-        # student is what we measure probability for
-        # We score how likely student tokens are under the expected distribution
-        exp_tokens = _tokens(expected)
-        stu_tokens = _tokens(student)
-        if not exp_tokens:
-            return 0.0
-        # Probabilistic overlap weighted by token frequency
-        common = exp_tokens & stu_tokens
-        score = len(common) / len(exp_tokens)
-        # Bonus if student has more related terms (coverage)
-        bonus = min(0.2, len(stu_tokens & exp_tokens) / max(1, len(stu_tokens)) * 0.3)
-        return min(1.0, score + bonus)
-    except Exception as e:
-        logger.warning("Naive Bayes failed: %s", e)
-        return _keyword_match(expected, student)
+# Prompt when expected answer IS provided
+GEMINI_EVAL_PROMPT_WITH_EXPECTED = """You are a strict but fair academic evaluator scoring a student's answer.
 
+Return ONLY valid JSON with no markdown fences:
+{{
+  "semantic_score": <float 0.0–1.0>,
+  "feedback": "<2–3 specific sentences: what is correct, what is missing or wrong, how to improve>",
+  "key_points_covered": [<list of concept strings the student correctly addressed>],
+  "key_points_missing": [<list of concept strings from expected answer the student missed>]
+}}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 7 — ADVANCED SEMANTIC MATCHING via Gemini (22%)
-# ══════════════════════════════════════════════════════════════════════════════
-
-GEMINI_PROMPT = """You are an academic evaluator scoring a student answer against an expected answer.
-
-TASK: Rate how well the student's answer covers the key concepts of the expected answer.
-Return ONLY a JSON object with:
-- "semantic_score": float between 0.0 and 1.0
-  * 1.0 = student fully understands and covers all key concepts (different wording is fine)
-  * 0.7-0.9 = covers most key concepts with minor gaps
-  * 0.4-0.6 = partially correct, some key concepts present
-  * 0.1-0.3 = minimal relevant content
-  * 0.0 = completely irrelevant
+SCORING GUIDE:
+- 0.90–1.00: All key concepts covered correctly (wording may differ)
+- 0.75–0.89: Very good, only minor details missing
+- 0.55–0.74: Good, main idea present but important details absent
+- 0.35–0.54: Partial, some relevant content but significant gaps
+- 0.15–0.34: Weak, barely touches on the topic
+- 0.00–0.14: Wrong or completely irrelevant
 
 RULES:
-- Different valid wording of the same idea = full credit for that concept
-- Reward partial understanding proportionally
-- Ignore spelling/grammar unless meaning is unclear
+- Synonyms and paraphrasing = full credit for that concept
+- Spelling/grammar errors do not reduce score unless meaning is lost
+- Ignore case and extra spaces (they are normalised)
+- Never return exactly 0.0 unless the answer is empty/gibberish
+- Never return exactly 1.0 unless the answer is flawlessly complete
+- Feedback MUST name specific concepts, not generic phrases like "good answer"
 
 EXPECTED ANSWER:
-\"\"\"
-{expected}
-\"\"\"
+\"\"\"{expected}\"\"\"
 
 STUDENT ANSWER:
-\"\"\"
-{student}
-\"\"\"
+\"\"\"{student}\"\"\""""
 
-Return ONLY: {{"semantic_score": <float>}}"""
+# Prompt when NO expected answer is provided — Gemini evaluates on its own knowledge
+GEMINI_EVAL_PROMPT_NO_EXPECTED = """You are a strict but fair academic evaluator.
+The teacher did NOT provide an expected answer, so evaluate the student's answer based on
+your own subject-matter knowledge.
 
-def _gemini_semantic(expected: str, student: str) -> Optional[float]:
-    """Returns 0.0-1.0 semantic score from Gemini, or None on failure."""
-    if not GEMINI_API_KEY or GEMINI_API_KEY in ("", "YOUR_GEMINI_API_KEY_HERE"):
+Question: \"\"\"{question}\"\"\"
+Student Answer: \"\"\"{student}\"\"\"
+
+Return ONLY valid JSON with no markdown fences:
+{{
+  "semantic_score": <float 0.0–1.0, how correct and complete the answer is>,
+  "feedback": "<2–3 specific sentences: what is correct, what is missing or wrong, what the full answer should include>",
+  "key_points_covered": [<concepts the student correctly mentioned>],
+  "key_points_missing": [<important concepts the student missed>]
+}}
+
+RULES:
+- Evaluate solely on factual correctness and completeness
+- Never return exactly 0.0 unless the answer is empty/gibberish
+- Feedback MUST reference specific subject-matter concepts"""
+
+
+def _gemini_evaluate(expected: str, student: str, question: str = "") -> Optional[dict]:
+    """Call Gemini with a thread timeout. Returns None on failure."""
+    if not GEMINI_API_KEY:
         return None
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=64,
-                response_mime_type="application/json",
-            ),
-        )
-        prompt = GEMINI_PROMPT.format(
-            expected=expected.strip()[:1500],
-            student=student.strip()[:1000]
-        )
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = model.generate_content(prompt)
-                raw = response.text.strip()
-                raw = re.sub(r"^```(?:json)?", "", raw).strip()
-                raw = re.sub(r"```$", "", raw).strip()
-                result = json.loads(raw)
-                score = float(result.get("semantic_score", 0.5))
-                score = max(0.0, min(1.0, score))
-                logger.info("Gemini semantic score: %.3f", score)
-                return score
-            except Exception as e:
-                logger.warning("Gemini attempt %d failed: %s", attempt, e)
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
-    except Exception as e:
-        logger.warning("Gemini init failed: %s", e)
-    return None
 
-def _advanced_semantic(expected: str, student: str) -> float:
-    """Try Gemini first, fallback to enhanced local semantic."""
-    gemini_score = _gemini_semantic(expected, student)
-    if gemini_score is not None:
-        return gemini_score
-    # Fallback: enhanced sentence-transformer with bi-directional check
-    try:
-        model = _get_st_model()
-        if model is None:
-            return _tfidf_cosine(expected, student)
-        from sklearn.metrics.pairwise import cosine_similarity
-        emb_exp = model.encode([expected])
-        emb_stu = model.encode([student])
-        # Split into sentences for partial coverage
-        exp_sentences = [s.strip() for s in re.split(r'[.!?]+', expected) if s.strip()]
-        stu_sentences = [s.strip() for s in re.split(r'[.!?]+', student) if s.strip()]
-        if not exp_sentences or not stu_sentences:
-            return float(cosine_similarity(emb_exp, emb_stu)[0][0])
-        # For each expected sentence, find best matching student sentence
-        exp_embs = model.encode(exp_sentences)
-        stu_embs = model.encode(stu_sentences)
-        coverage_scores = []
-        for e_emb in exp_embs:
-            sims = [float(cosine_similarity([e_emb], [s_emb])[0][0]) for s_emb in stu_embs]
-            coverage_scores.append(max(sims))
-        coverage = sum(coverage_scores) / len(coverage_scores)
-        overall = float(cosine_similarity(emb_exp, emb_stu)[0][0])
-        return coverage * 0.6 + overall * 0.4
-    except Exception as e:
-        logger.warning("Advanced semantic fallback failed: %s", e)
-        return _tfidf_cosine(expected, student)
+    result_holder = [None]
+    error_holder  = [None]
 
+    def _call():
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel(GEMINI_MODEL)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 8 — COHERENCE & STRUCTURE (10%)
-# ══════════════════════════════════════════════════════════════════════════════
+            if expected.strip():
+                prompt = GEMINI_EVAL_PROMPT_WITH_EXPECTED.format(
+                    expected=expected, student=student
+                )
+            else:
+                prompt = GEMINI_EVAL_PROMPT_NO_EXPECTED.format(
+                    question=question or "Unknown question", student=student
+                )
 
-def _coherence_score(expected: str, student: str) -> float:
-    """
-    Evaluates structural quality and length appropriateness of student answer
-    relative to the expected answer.
-    """
-    exp_words = len(expected.split())
-    stu_words = len(student.split())
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    resp = model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0,
+                            "max_output_tokens": 500,
+                            "response_mime_type": "application/json",
+                        }
+                    )
+                    text = resp.text.strip()
+                    # Strip markdown fences if model ignores mime type
+                    text = re.sub(r"^```json\s*", "", text)
+                    text = re.sub(r"```$", "", text).strip()
+                    data = json.loads(text)
+                    score = float(data.get("semantic_score", 0.5))
+                    score = max(0.01, min(0.99, score))
 
-    if stu_words == 0:
-        return 0.0
+                    # Validate and clean key points lists
+                    covered = data.get("key_points_covered", [])
+                    missing = data.get("key_points_missing", [])
+                    if not isinstance(covered, list): covered = []
+                    if not isinstance(missing, list): missing = []
+                    covered = [str(x).strip() for x in covered if str(x).strip()]
+                    missing = [str(x).strip() for x in missing if str(x).strip()]
 
-    # Length ratio (student should be at least 40% as long as expected)
-    length_ratio = min(1.0, stu_words / max(1, exp_words))
-    if length_ratio < 0.1:
-        length_ratio_score = 0.1
-    elif length_ratio < 0.4:
-        length_ratio_score = 0.4
-    else:
-        length_ratio_score = min(1.0, length_ratio)
+                    result_holder[0] = {
+                        "score":              score,
+                        "feedback":           str(data.get("feedback", "")).strip(),
+                        "key_points_covered": covered,
+                        "key_points_missing": missing,
+                    }
+                    return
+                except (json.JSONDecodeError, Exception) as e:
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        error_holder[0] = e
+        except Exception as e:
+            error_holder[0] = e
 
-    # Sentence structure quality
-    sentences = [s.strip() for s in re.split(r'[.!?]+', student) if s.strip()]
-    num_sentences = len(sentences)
-    avg_sent_len = stu_words / max(1, num_sentences)
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=GEMINI_TIMEOUT)
 
-    if avg_sent_len < 3:
-        structure_score = 0.2
-    elif avg_sent_len <= 8:
-        structure_score = 0.5
-    elif avg_sent_len <= 25:
-        structure_score = 1.0
-    elif avg_sent_len <= 40:
-        structure_score = 0.8
-    else:
-        structure_score = 0.6
-
-    # Multi-sentence bonus
-    sentence_bonus = min(0.2, (num_sentences - 1) * 0.05) if num_sentences > 1 else 0.0
-
-    return min(1.0, length_ratio_score * 0.5 + structure_score * 0.4 + sentence_bonus * 0.1)
+    if t.is_alive():
+        logger.warning("Gemini timed out after %ss — using local fallback.", GEMINI_TIMEOUT)
+        return None
+    if error_holder[0]:
+        logger.warning("Gemini error: %s", error_holder[0])
+        return None
+    return result_holder[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 9 — CONCEPT MATCHING WITH SYNONYMS (10%)
+# TECHNIQUE 6 — SYNONYM MATCHING (built-in map + optional WordNet)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Synonym groups for common academic/general concepts
 SYNONYM_GROUPS = [
-    {"increase", "rise", "grow", "expand", "improve", "enhance", "boost", "elevate"},
-    {"decrease", "reduce", "fall", "decline", "drop", "diminish", "lower", "shrink"},
-    {"cause", "reason", "factor", "source", "origin", "result", "effect", "consequence"},
-    {"important", "significant", "crucial", "vital", "essential", "key", "major", "critical"},
-    {"process", "method", "technique", "approach", "procedure", "system", "mechanism"},
-    {"example", "instance", "case", "illustration", "sample"},
-    {"define", "describe", "explain", "illustrate", "state", "mention"},
-    {"use", "utilize", "apply", "employ", "implement"},
-    {"create", "produce", "generate", "make", "form", "develop", "build"},
-    {"show", "demonstrate", "prove", "indicate", "reveal", "display"},
-    {"large", "big", "huge", "great", "enormous", "vast", "massive"},
-    {"small", "tiny", "little", "minor", "minimal", "slight"},
-    {"fast", "quick", "rapid", "swift", "speedy"},
-    {"slow", "gradual", "steady", "delayed"},
-    {"correct", "accurate", "right", "true", "valid", "proper"},
-    {"wrong", "incorrect", "false", "invalid", "improper", "inaccurate"},
-    {"help", "assist", "support", "aid", "benefit", "facilitate"},
-    {"need", "require", "must", "necessary", "essential", "demand"},
-    {"energy", "power", "force", "strength"},
-    {"data", "information", "knowledge", "facts"},
-    {"test", "experiment", "study", "research", "analysis", "examination"},
-    {"cell", "unit", "component", "element", "part"},
-    {"body", "organism", "system", "structure"},
-    {"change", "alter", "modify", "transform", "convert"},
-    {"connect", "link", "join", "relate", "associate"},
-    {"control", "manage", "regulate", "govern", "direct"},
-    {"measure", "calculate", "compute", "evaluate", "assess"},
-    {"store", "save", "retain", "hold", "contain"},
-    {"remove", "delete", "eliminate", "destroy", "clear"},
-    {"light", "radiation", "energy", "wave", "beam"},
-    {"water", "liquid", "fluid", "solution"},
-    {"plant", "vegetation", "flora", "organism"},
-    {"animal", "creature", "organism", "species"},
+    {"big","large","huge","enormous","great","vast","massive","gigantic"},
+    {"small","little","tiny","minute","petite","mini","miniature"},
+    {"fast","quick","rapid","swift","speedy","hasty"},
+    {"slow","sluggish","leisurely","gradual","unhurried"},
+    {"smart","intelligent","clever","bright","wise","brilliant"},
+    {"happy","joyful","glad","pleased","content","cheerful","delighted"},
+    {"sad","unhappy","sorrowful","miserable","depressed","gloomy"},
+    {"angry","furious","mad","irate","enraged"},
+    {"beautiful","pretty","attractive","gorgeous","lovely","stunning"},
+    {"good","great","excellent","fine","superb","outstanding","wonderful"},
+    {"bad","poor","terrible","awful","dreadful","horrible"},
+    {"start","begin","commence","initiate","launch","open"},
+    {"end","finish","conclude","terminate","complete","close","stop"},
+    {"make","create","build","construct","produce","form","generate"},
+    {"show","display","present","exhibit","demonstrate","reveal"},
+    {"think","believe","consider","suppose","assume"},
+    {"say","tell","speak","utter","state","mention","declare"},
+    {"help","assist","aid","support","facilitate"},
+    {"use","utilize","employ","apply","operate"},
+    {"increase","grow","rise","expand","escalate","improve","enhance"},
+    {"decrease","reduce","fall","decline","diminish","lessen"},
+    {"important","significant","crucial","vital","essential","key","critical"},
+    {"difficult","hard","challenging","tough","complex","complicated"},
+    {"easy","simple","straightforward","effortless","uncomplicated"},
+    {"car","automobile","vehicle","auto","motorcar"},
+    {"house","home","residence","dwelling","abode"},
+    {"doctor","physician","medic","clinician"},
+    {"teacher","educator","instructor","professor","tutor"},
+    {"student","pupil","learner","scholar"},
+    {"water","liquid","fluid","aqua"},
+    {"food","nourishment","sustenance","nutrition","meal"},
+    {"money","currency","cash","funds","capital","finance"},
+    {"work","job","employment","occupation","career","profession"},
+    {"problem","issue","trouble","difficulty","challenge"},
+    {"answer","solution","response","reply","result"},
+    {"cause","reason","factor","source","origin"},
+    {"effect","result","outcome","consequence","impact"},
+    {"method","approach","technique","process","procedure","way"},
+    {"change","modify","alter","transform","adjust","update"},
+    {"control","manage","regulate","govern","direct","oversee"},
+    {"system","network","structure","framework","organization"},
+    {"energy","power","force","strength"},
+    {"data","information","facts","details","evidence"},
+    {"law","rule","principle","regulation","guideline"},
+    {"theory","concept","idea","hypothesis","model"},
+    {"cell","unit","element","component","particle"},
+    {"part","component","section","portion","piece"},
+    {"type","kind","sort","category","class","variety"},
+    {"area","region","zone","territory","domain","field"},
+    {"send","transmit","transfer","deliver","dispatch"},
+    {"receive","get","obtain","acquire","gain"},
+    {"produce","generate","yield","output","emit"},
+    {"absorb","take in","consume","ingest","incorporate"},
+    {"contain","hold","include","encompass","comprise"},
+    {"allow","permit","enable","let","authorize"},
+    {"prevent","stop","block","inhibit","restrict","hinder"},
+    {"provide","supply","give","offer","deliver","furnish"},
+    {"support","back","endorse","uphold","sustain"},
+    {"plant","vegetation","flora","organism","herb","shrub"},
+    {"animal","creature","organism","beast","fauna"},
+    {"connect","link","join","attach","unite","combine"},
+    {"break","damage","destroy","ruin","harm","impair"},
+    {"protect","guard","defend","shield","preserve","secure"},
+    {"measure","calculate","compute","quantify","assess","evaluate"},
+    {"store","save","keep","retain","preserve","hold"},
+    {"remove","delete","eliminate","erase","clear"},
+    {"move","travel","go","proceed","advance","migrate"},
+    {"release","emit","discharge","expel"},
 ]
 
 def _build_synonym_map() -> dict:
-    word_to_group = {}
-    for i, group in enumerate(SYNONYM_GROUPS):
-        for word in group:
-            word_to_group[word] = i
-    return word_to_group
+    m = {}
+    for i, grp in enumerate(SYNONYM_GROUPS):
+        for w in grp:
+            m[w] = i
+    return m
 
 _SYNONYM_MAP = _build_synonym_map()
+
+def _synonym_match(expected: str, student: str) -> float:
+    # Try NLTK WordNet first
+    try:
+        import nltk
+        from nltk.corpus import wordnet
+        try:
+            nltk.data.find("corpora/wordnet")
+        except LookupError:
+            nltk.download("wordnet", quiet=True)
+            nltk.download("omw-1.4", quiet=True)
+
+        exp_tokens = _tokens(expected)
+        stu_tokens = _tokens(student)
+        if not exp_tokens:
+            return 0.5  # neutral when no reference
+
+        def get_synonyms(word):
+            syns = {word}
+            for syn in wordnet.synsets(word):
+                for lemma in syn.lemmas():
+                    syns.add(lemma.name().lower().replace("_", " "))
+            return syns
+
+        matched = 0.0
+        for ew in exp_tokens:
+            if ew in stu_tokens:
+                matched += 1.0
+                continue
+            ew_syns = get_synonyms(ew)
+            if ew_syns & stu_tokens:
+                matched += 0.9
+                continue
+            grp = _SYNONYM_MAP.get(ew)
+            if grp is not None and any(_SYNONYM_MAP.get(sw) == grp for sw in stu_tokens):
+                matched += 0.85
+
+        return min(1.0, matched / len(exp_tokens))
+
+    except Exception:
+        # Pure built-in synonym map fallback
+        exp_tokens = _tokens(expected)
+        stu_tokens = _tokens(student)
+        if not exp_tokens:
+            return 0.5
+        matched = 0.0
+        for ew in exp_tokens:
+            if ew in stu_tokens:
+                matched += 1.0
+                continue
+            grp = _SYNONYM_MAP.get(ew)
+            if grp is not None and any(_SYNONYM_MAP.get(sw) == grp for sw in stu_tokens):
+                matched += 0.85
+        return min(1.0, matched / len(exp_tokens))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TECHNIQUE 7 — CONCEPT MATCH WITH STEM PREFIX
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _concept_match(expected: str, student: str) -> float:
     exp_tokens = _tokens(expected)
     stu_tokens = _tokens(student)
-
     if not exp_tokens:
-        return 0.0
-
-    matched = 0
-    total = len(exp_tokens)
-
-    for exp_word in exp_tokens:
-        # Direct match
-        if exp_word in stu_tokens:
-            matched += 1
+        return 0.5
+    matched = 0.0
+    for ew in exp_tokens:
+        if ew in stu_tokens:
+            matched += 1.0
             continue
-        # Synonym match
-        exp_group = _SYNONYM_MAP.get(exp_word)
-        if exp_group is not None:
-            for stu_word in stu_tokens:
-                if _SYNONYM_MAP.get(stu_word) == exp_group:
-                    matched += 0.85  # Slight penalty for synonym vs exact
-                    break
-        # Partial stem match (crude stemming)
-        elif len(exp_word) > 5:
-            stem = exp_word[:len(exp_word)-2]  # Simple suffix stripping
-            if any(w.startswith(stem) for w in stu_tokens):
-                matched += 0.7
-
-    return min(1.0, matched / total)
+        grp = _SYNONYM_MAP.get(ew)
+        if grp is not None and any(_SYNONYM_MAP.get(sw) == grp for sw in stu_tokens):
+            matched += 0.85
+            continue
+        if len(ew) > 5:
+            stem = ew[:max(3, len(ew) - 3)]
+            if any(sw.startswith(stem) for sw in stu_tokens):
+                matched += 0.70
+    return min(1.0, matched / len(exp_tokens))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WEIGHTED HYBRID SCORER
+# SCORING WEIGHTS (must sum to 1.0)
 # ══════════════════════════════════════════════════════════════════════════════
 
-WEIGHTS = {
-    "exact_match":       0.05,
-    "keyword_match":     0.12,
-    "tfidf_cosine":      0.12,
-    "sentiment":         0.03,
-    "semantic_sim":      0.18,
-    "naive_bayes":       0.08,
-    "advanced_semantic": 0.22,
-    "coherence":         0.10,
-    "concept_match":     0.10,
+WEIGHTS_WITH_GEMINI = {
+    "exact_match":   0.03,
+    "keyword_match": 0.10,
+    "tfidf_cosine":  0.10,
+    "semantic_sim":  0.20,
+    "gemini":        0.35,   # dominant when available
+    "synonym_match": 0.12,
+    "concept_match": 0.10,
 }
 
-def _local_evaluate(expected: str, student: str) -> dict:
-    """Full 9-technique weighted evaluation. Returns score 0–10 and feedback."""
+WEIGHTS_LOCAL_ONLY = {
+    "exact_match":   0.05,
+    "keyword_match": 0.18,
+    "tfidf_cosine":  0.18,
+    "semantic_sim":  0.32,
+    "synonym_match": 0.15,
+    "concept_match": 0.12,
+}
 
-    scores = {
-        "exact_match":       _exact_match(expected, student),
-        "keyword_match":     _keyword_match(expected, student),
-        "tfidf_cosine":      _tfidf_cosine(expected, student),
-        "sentiment":         _sentiment_similarity(expected, student),
-        "semantic_sim":      _semantic_similarity(expected, student),
-        "naive_bayes":       _naive_bayes_score(expected, student),
-        "advanced_semantic": _advanced_semantic(expected, student),
-        "coherence":         _coherence_score(expected, student),
-        "concept_match":     _concept_match(expected, student),
-    }
 
-    # Weighted blend
-    raw = sum(scores[k] * WEIGHTS[k] for k in WEIGHTS)
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILD RESULT — apply guardrails, produce structured output
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # --- Guardrails to ensure varied, meaningful scores ---
+def _build_result(raw: float, scores: dict, feedback: str,
+                  covered: list, missing: list, used_gemini: bool,
+                  no_expected: bool = False) -> dict:
+    """Apply tiered floors and produce final result dict."""
 
-    # Strong semantic anchor: if advanced_semantic is high, floor the score
-    adv = scores["advanced_semantic"]
-    sem = scores["semantic_sim"]
-    kw  = scores["keyword_match"]
-    con = scores["concept_match"]
+    gem = scores.get("gemini", 0.5)
+    sem = scores.get("semantic_sim", 0)
+    kw  = scores.get("keyword_match", 0)
+    con = scores.get("concept_match", 0)
+    syn = scores.get("synonym_match", 0)
 
-    # Compute a "content signal" (how much correct substance is present)
-    content_signal = (adv * 0.4 + sem * 0.3 + kw * 0.2 + con * 0.1)
+    content_signal = gem * 0.4 + sem * 0.3 + kw * 0.15 + syn * 0.08 + con * 0.07
 
-    # Apply tiered floors
-    if content_signal >= 0.80:
-        raw = max(raw, 0.80)   # → score 8+
-    elif content_signal >= 0.65:
-        raw = max(raw, 0.65)   # → score 6-7
-    elif content_signal >= 0.45:
-        raw = max(raw, 0.45)   # → score 4-5
-    elif content_signal >= 0.25:
-        raw = max(raw, 0.25)   # → score 2-3
-    elif content_signal >= 0.10:
-        raw = max(raw, 0.10)   # → score 1
+    # Tiered floors — ensure realistic spread
+    if content_signal >= 0.88:
+        raw = max(raw, 0.87)
+    elif content_signal >= 0.72:
+        raw = max(raw, 0.68)
+    elif content_signal >= 0.55:
+        raw = max(raw, 0.47)
+    elif content_signal >= 0.38:
+        raw = max(raw, 0.30)
+    elif content_signal >= 0.20:
+        raw = max(raw, 0.14)
+    elif content_signal >= 0.08:
+        raw = max(raw, 0.07)
 
-    # Cap: only give 10 for very high ALL-round scores
-    if raw >= 0.95 and content_signal >= 0.90:
+    # Map to final integer score
+    if raw >= 0.96 and content_signal >= 0.93:
         final_score = 10
     else:
-        # Scale to 0-10 with 1 decimal precision, then round
-        final_score = round(min(9.5, raw * 10))
+        scaled = raw * 10
+        final_score = max(1, min(9, round(scaled)))
+        if content_signal < 0.05:
+            final_score = 0
 
-    final_score = max(0, min(10, int(final_score)))
+    final_score = int(max(0, min(10, final_score)))
 
-    # Build detailed feedback
-    if final_score == 10:
-        feedback = "Excellent! Your answer perfectly covers all key concepts and demonstrates thorough understanding."
-    elif final_score >= 8:
-        feedback = (f"Very good answer. Strong semantic alignment ({adv*100:.0f}% concept coverage). "
-                    f"Minor details could be expanded for a perfect score.")
-    elif final_score >= 6:
-        feedback = (f"Good answer. You covered the main ideas (keyword overlap: {kw*100:.0f}%). "
-                    f"Adding more detail and specific terminology would improve your score.")
-    elif final_score >= 4:
-        feedback = (f"Partial answer. Some relevant concepts present (concept match: {con*100:.0f}%), "
-                    f"but significant key points are missing or underdeveloped.")
-    elif final_score >= 2:
-        feedback = (f"Weak answer. Very limited relevant content found (content signal: {content_signal*100:.0f}%). "
-                    f"Most key concepts from the expected answer are absent.")
-    elif final_score == 1:
-        feedback = "Minimal relevant content. The answer barely touches on the topic."
-    else:
-        feedback = "The answer does not address the question. Please review the topic."
+    # Build feedback if Gemini did not supply one
+    if not feedback:
+        feedback = _build_local_feedback(
+            final_score, scores, covered, missing, no_expected
+        )
 
     logger.info(
-        "Scores → exact:%.2f kw:%.2f tfidf:%.2f senti:%.2f sem:%.2f nb:%.2f adv:%.2f coh:%.2f con:%.2f → raw:%.3f → final:%d",
-        scores["exact_match"], scores["keyword_match"], scores["tfidf_cosine"],
-        scores["sentiment"], scores["semantic_sim"], scores["naive_bayes"],
-        scores["advanced_semantic"], scores["coherence"], scores["concept_match"],
-        raw, final_score
+        "Score→ exact:%.2f kw:%.2f tfidf:%.2f sem:%.2f gem:%.2f "
+        "syn:%.2f con:%.2f | raw:%.3f → %d (gemini=%s, no_expected=%s)",
+        scores.get("exact_match", 0), kw,
+        scores.get("tfidf_cosine", 0), sem,
+        gem, syn, con,
+        raw, final_score, used_gemini, no_expected
     )
 
     return {
-        "score": final_score,
-        "feedback": feedback,
-        "breakdown": {k: round(v * 10, 2) for k, v in scores.items()},
+        "score":              final_score,
+        "feedback":           feedback,
+        "key_points_covered": covered,
+        "key_points_missing": missing,
+        "breakdown":          {k: round(v * 10, 2) for k, v in scores.items()},
+        "used_gemini":        used_gemini,
+        "no_expected_answer": no_expected,
     }
+
+
+def _build_local_feedback(score: int, scores: dict, covered: list,
+                           missing: list, no_expected: bool) -> str:
+    """
+    Produce meaningful, specific feedback without Gemini.
+    References actual metric values — not generic phrases.
+    """
+    kw  = scores.get("keyword_match", 0)
+    sem = scores.get("semantic_sim", 0)
+    con = scores.get("concept_match", 0)
+    syn = scores.get("synonym_match", 0)
+
+    covered_str = ", ".join(covered[:3]) if covered else None
+    missing_str = ", ".join(missing[:3]) if missing else None
+
+    if score == 10:
+        return (
+            "Excellent — your answer covers all key concepts with precision. "
+            "The semantic structure closely matches the expected answer."
+        )
+    if score >= 8:
+        msg = f"Very strong answer (keyword overlap: {int(kw*100)}%, concept match: {int(con*100)}%). "
+        if missing_str:
+            msg += f"Minor points that could be added: {missing_str}."
+        else:
+            msg += "Only minor elaboration could improve this further."
+        return msg
+    if score >= 6:
+        msg = f"Good answer — main idea is present (semantic similarity: {int(sem*100)}%). "
+        if missing_str:
+            msg += f"Key concepts that are missing: {missing_str}. "
+        if covered_str:
+            msg += f"Correctly covered: {covered_str}."
+        return msg
+    if score >= 4:
+        msg = f"Partial answer (concept match: {int(con*100)}%). "
+        if covered_str:
+            msg += f"You correctly mentioned: {covered_str}. "
+        if missing_str:
+            msg += f"Important missing concepts: {missing_str}."
+        else:
+            msg += "Significant portions of the expected answer are absent."
+        return msg
+    if score >= 2:
+        msg = f"Weak answer — limited relevant content (keyword match: {int(kw*100)}%). "
+        if missing_str:
+            msg += f"Missing core concepts: {missing_str}. "
+        msg += "Review the material and focus on including specific terminology."
+        return msg
+    if score == 1:
+        if no_expected:
+            return (
+                "The answer contains minimal relevant content based on AI knowledge evaluation. "
+                "Review the topic and aim to include specific definitions and examples."
+            )
+        return (
+            "The answer barely touches the topic. "
+            "Most key concepts from the expected answer are absent. "
+            "Please review the material thoroughly."
+        )
+    # score == 0
+    if no_expected:
+        return "No answer was submitted, or the response was entirely off-topic."
+    return "No answer submitted, or the response does not address the question."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE EVALUATION PIPELINES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _evaluate_with_expected(expected: str, student: str) -> dict:
+    """Full 7-technique pipeline when expected answer is available."""
+    scores = {
+        "exact_match":   _exact_match(expected, student),
+        "keyword_match": _keyword_match(expected, student),
+        "tfidf_cosine":  _tfidf_cosine(expected, student),
+        "semantic_sim":  _semantic_similarity(expected, student),
+        "gemini":        0.5,   # placeholder
+        "synonym_match": _synonym_match(expected, student),
+        "concept_match": _concept_match(expected, student),
+    }
+
+    feedback = ""
+    covered = []
+    missing = []
+    used_gemini = False
+
+    gemini_result = _gemini_evaluate(expected, student)
+    if gemini_result:
+        scores["gemini"] = gemini_result["score"]
+        feedback = gemini_result.get("feedback", "")
+        covered  = gemini_result.get("key_points_covered", [])
+        missing  = gemini_result.get("key_points_missing", [])
+        used_gemini = True
+        raw = sum(scores[k] * WEIGHTS_WITH_GEMINI[k] for k in WEIGHTS_WITH_GEMINI)
+    else:
+        # Redistribute Gemini's weight among local techniques
+        raw = sum(scores[k] * WEIGHTS_LOCAL_ONLY[k] for k in WEIGHTS_LOCAL_ONLY
+                  if k in scores)
+
+    return _build_result(raw, scores, feedback, covered, missing, used_gemini, no_expected=False)
+
+
+def _evaluate_without_expected(student: str, question: str = "") -> dict:
+    """
+    Evaluate when NO expected answer is stored.
+    Gemini evaluates based on its own subject-matter knowledge.
+    Local fallback uses heuristics (length, coherence, vocabulary richness).
+    """
+    feedback = ""
+    covered = []
+    missing = []
+    used_gemini = False
+
+    # Try Gemini first — it can evaluate factual correctness without a reference
+    gemini_result = _gemini_evaluate(expected="", student=student, question=question)
+
+    if gemini_result:
+        gem_score = gemini_result["score"]
+        feedback  = gemini_result.get("feedback", "")
+        covered   = gemini_result.get("key_points_covered", [])
+        missing   = gemini_result.get("key_points_missing", [])
+        used_gemini = True
+
+        # Use Gemini score directly (no local reference to compare against)
+        final_score = max(1, min(9, round(gem_score * 10)))
+        if gem_score < 0.05:
+            final_score = 0
+
+        if not feedback:
+            feedback = _build_local_feedback(
+                final_score,
+                {"keyword_match": gem_score, "semantic_sim": gem_score,
+                 "concept_match": gem_score, "synonym_match": gem_score, "gemini": gem_score},
+                covered, missing, no_expected=True
+            )
+
+        return {
+            "score":              final_score,
+            "feedback":           feedback,
+            "key_points_covered": covered,
+            "key_points_missing": missing,
+            "breakdown":          {"gemini": round(gem_score * 10, 2)},
+            "used_gemini":        True,
+            "no_expected_answer": True,
+        }
+
+    else:
+        # Pure heuristic: estimate quality from length + vocabulary richness
+        words = student.split()
+        word_count = len(words)
+        unique_ratio = len(set(w.lower() for w in words)) / max(1, word_count)
+        meaningful = len(_tokens(student))
+
+        if word_count == 0:
+            heuristic = 0.0
+        elif word_count < 5:
+            heuristic = 0.10
+        elif word_count < 15:
+            heuristic = 0.25 + unique_ratio * 0.15
+        elif word_count < 40:
+            heuristic = 0.35 + unique_ratio * 0.20 + min(0.10, meaningful / 50)
+        else:
+            heuristic = 0.45 + unique_ratio * 0.20 + min(0.10, meaningful / 60)
+
+        heuristic = min(0.65, heuristic)   # cap at 6.5/10 without a reference
+        final_score = max(1, min(6, round(heuristic * 10)))
+        if word_count == 0:
+            final_score = 0
+
+        feedback = (
+            f"No expected answer is on file for this question. "
+            f"Your answer has been evaluated on length ({word_count} words) and "
+            f"vocabulary richness ({int(unique_ratio*100)}% unique words). "
+            f"For a more accurate score, ask your teacher to add an expected answer."
+        )
+
+        return {
+            "score":              final_score,
+            "feedback":           feedback,
+            "key_points_covered": [],
+            "key_points_missing": [],
+            "breakdown":          {"heuristic": round(heuristic * 10, 2)},
+            "used_gemini":        False,
+            "no_expected_answer": True,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ai_evaluate(expected_answer: str, student_answer: str) -> dict:
+def ai_evaluate(expected_answer: str, student_answer: str,
+                question_text: str = "") -> dict:
     """
-    Evaluate student answer using hybrid 9-technique pipeline.
-    1. Empty answer → 0
-    2. Exact match → 10
-    3. Cache check → return cached
-    4. Full hybrid evaluation
+    Evaluate student answer.
+
+    Parameters
+    ----------
+    expected_answer : str
+        The teacher's expected answer. May be empty — Gemini will evaluate
+        based on its own knowledge if the API key is set.
+    student_answer  : str
+        The student's answer.
+    question_text   : str
+        The question text — used when expected_answer is absent so Gemini
+        has context to evaluate against.
+
+    Returns
+    -------
+    dict with keys: score, feedback, key_points_covered, key_points_missing,
+                    breakdown, used_gemini, no_expected_answer
     """
-    if not expected_answer or not expected_answer.strip():
-        raise ValueError("expected_answer cannot be empty.")
+    expected = (expected_answer or "").strip()
+    student  = (student_answer  or "").strip()
 
-    if not student_answer or not student_answer.strip():
-        return {"score": 0, "feedback": "No answer was submitted.", "breakdown": {}}
+    # Empty student answer — always 0
+    if not student:
+        return {
+            "score":              0,
+            "feedback":           "No answer was submitted.",
+            "key_points_covered": [],
+            "key_points_missing": [],
+            "breakdown":          {},
+            "used_gemini":        False,
+            "no_expected_answer": not bool(expected),
+        }
 
-    # Exact match fast-path
-    if expected_answer.strip().lower() == student_answer.strip().lower():
-        return {"score": 10, "feedback": "Exact match with the expected answer.", "breakdown": {}}
+    # Normalised exact match fast-path (only when expected exists)
+    if expected and normalise(expected) == normalise(student):
+        return {
+            "score":              10,
+            "feedback":           "Perfect match — your answer covers all required concepts.",
+            "key_points_covered": [],
+            "key_points_missing": [],
+            "breakdown":          {},
+            "used_gemini":        False,
+            "no_expected_answer": False,
+        }
 
-    # Cache check
-    key = _cache_key(expected_answer, student_answer)
-    if key in _eval_cache:
-        return _eval_cache[key]
+    # Cache check (include question_text so no-expected evaluations differ per question)
+    cache_key_str = f"{expected}|||{student}|||{question_text}"
+    key = hashlib.sha256(cache_key_str.lower().strip().encode()).hexdigest()
+    with _cache_lock:
+        if key in _eval_cache:
+            return _eval_cache[key]
 
-    # Full hybrid evaluation
-    result = _local_evaluate(expected_answer, student_answer)
-    _eval_cache[key] = result
+    if expected:
+        result = _evaluate_with_expected(expected, student)
+    else:
+        result = _evaluate_without_expected(student, question=question_text)
+
+    with _cache_lock:
+        _eval_cache[key] = result
     return result
 
 
 def ai_evaluate_safe(expected_answer: str, student_answer: str,
+                     question_text: str = "",
                      fallback_score: Optional[int] = None) -> dict:
-    """Never raises. Returns fallback result on any error."""
+    """
+    Never raises. Returns a safe fallback result on any error.
+    Always call this from routes — never call ai_evaluate() directly.
+    """
     try:
-        return ai_evaluate(expected_answer, student_answer)
+        return ai_evaluate(expected_answer, student_answer, question_text)
     except Exception as e:
         logger.error("ai_evaluate_safe error: %s", e)
         score = fallback_score if fallback_score is not None else 0
         return {
-            "score": score,
-            "feedback": "Evaluation unavailable. Score assigned automatically.",
-            "breakdown": {},
-            "error": str(e),
+            "score":              score,
+            "feedback":           "Evaluation service temporarily unavailable. Score assigned automatically.",
+            "key_points_covered": [],
+            "key_points_missing": [],
+            "breakdown":          {},
+            "used_gemini":        False,
+            "no_expected_answer": not bool((expected_answer or "").strip()),
+            "error":              str(e),
         }

@@ -6,157 +6,413 @@
     <title>Take Test — AES_ai</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     <style>
-        body { background-color: #1a1a2e; color: #eee; }
-        .navbar { background-color: #16213e !important; }
-        .navbar-brand, .nav-link { color: #e0e0e0 !important; }
-        .nav-link:hover { color: #a78bfa !important; }
-
-        .test-header {
-            background: linear-gradient(135deg, #16213e, #0f3460);
-            border-left: 4px solid #a78bfa;
-            border-radius: 8px;
-            padding: 20px 24px;
-            margin-bottom: 28px;
+        :root {
+            --bg:       #0b0f1a;
+            --surface:  #141824;
+            --surface2: #1c2333;
+            --border:   #2a3245;
+            --accent:   #6c63ff;
+            --accent2:  #a78bfa;
+            --text:     #e2e8f0;
+            --muted:    #8892a4;
+            --success:  #10b981;
+            --warning:  #f59e0b;
         }
-        .test-header h2 { margin: 0; font-size: 1.6rem; color: #fff; }
-        .test-header p  { margin: 6px 0 0; color: #a0a0c0; font-size: 0.9rem; }
+        * { box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
 
-        .question-card {
-            background: #16213e;
-            border: 1px solid #2d2d5e;
+        /* ── Navbar ── */
+        .navbar { background: var(--surface) !important; border-bottom: 1px solid var(--border); }
+        .navbar-brand { color: var(--accent2) !important; font-weight: 700; }
+        .nav-link { color: #94a3b8 !important; }
+        .nav-link:hover { color: var(--accent2) !important; }
+
+        /* ════════════════════════════════════════════
+           OVERLAY — redesigned for parallel eval UX
+           Shows real-time per-question progress bars
+           ════════════════════════════════════════════ */
+        .eval-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(8, 11, 22, 0.93);
+            z-index: 9999;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            backdrop-filter: blur(6px);
+        }
+        .eval-overlay.active { display: flex; }
+
+        .eval-box {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 36px 44px;
+            text-align: center;
+            max-width: 460px;
+            width: 92%;
+            box-shadow: 0 24px 80px rgba(108,99,255,0.15);
+        }
+
+        /* Dual-ring spinner — faster, snappier feel */
+        .spinner-wrap {
+            position: relative;
+            width: 68px; height: 68px;
+            margin: 0 auto 24px;
+        }
+        .spinner-outer {
+            position: absolute; inset: 0;
+            border: 4px solid var(--border);
+            border-top-color: var(--accent2);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        .spinner-inner {
+            position: absolute; inset: 10px;
+            border: 3px solid transparent;
+            border-bottom-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.5s linear infinite reverse;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .eval-title {
+            font-size: 1.18rem;
+            font-weight: 700;
+            color: var(--text);
+            margin-bottom: 6px;
+        }
+        .eval-sub {
+            font-size: 0.82rem;
+            color: var(--muted);
+            line-height: 1.6;
+            margin-bottom: 22px;
+        }
+
+        /* Speed badge */
+        .speed-badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #1a1040, #2d2060);
+            border: 1px solid #3b2d6a;
+            border-radius: 20px;
+            padding: 4px 14px;
+            font-size: 0.75rem;
+            color: #c4b5fd;
+            margin-bottom: 22px;
+            letter-spacing: 0.3px;
+        }
+        .speed-badge strong { color: var(--accent2); }
+
+        /* Phase steps — horizontal pills */
+        .phase-steps {
+            display: flex;
+            gap: 6px;
+            justify-content: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .phase-pill {
+            font-size: 0.72rem;
+            padding: 5px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            color: var(--muted);
+            background: var(--bg);
+            transition: all 0.35s ease;
+            white-space: nowrap;
+        }
+        .phase-pill.active {
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            border-color: var(--accent);
+            color: #fff;
+            font-weight: 600;
+        }
+        .phase-pill.done {
+            background: #064e3b;
+            border-color: #065f46;
+            color: #6ee7b7;
+        }
+
+        /* Overall progress bar */
+        .overall-progress {
+            margin-top: 6px;
+        }
+        .overall-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.74rem;
+            color: var(--muted);
+            margin-bottom: 6px;
+        }
+        .overall-label span:last-child { color: var(--accent2); font-weight: 600; }
+        .progress-track {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            border-radius: 4px;
+            width: 0%;
+            transition: width 0.5s cubic-bezier(0.4,0,0.2,1);
+        }
+
+        /* Estimated time hint */
+        .time-hint {
+            margin-top: 14px;
+            font-size: 0.74rem;
+            color: #475569;
+        }
+        .time-hint strong { color: var(--muted); }
+
+        /* ── Page header ── */
+        .page-header {
+            background: linear-gradient(135deg, var(--surface2), var(--surface));
+            border-left: 4px solid var(--accent);
             border-radius: 10px;
+            padding: 18px 24px;
+            margin: 24px 0 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .page-header h2 { margin: 0; font-size: 1.4rem; }
+        .page-header p { margin: 4px 0 0; color: var(--muted); font-size: 0.87rem; }
+
+        .btn-back {
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            padding: 7px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+        .btn-back:hover { color: var(--text); border-color: var(--accent); text-decoration: none; }
+
+        /* ── AI info strip ── */
+        .ai-info {
+            background: linear-gradient(135deg, #1a1040, #1c2333);
+            border: 1px solid #3b2d6a;
+            border-radius: 10px;
+            padding: 12px 18px;
+            margin-bottom: 22px;
+            font-size: 0.84rem;
+            color: #c4b5fd;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .ai-info strong { color: var(--accent2); }
+
+        /* Speed info strip */
+        .speed-info {
+            background: linear-gradient(135deg, #0d1f12, #141824);
+            border: 1px solid #1a4a28;
+            border-radius: 10px;
+            padding: 10px 18px;
+            margin-bottom: 22px;
+            font-size: 0.82rem;
+            color: #6ee7b7;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* ── Progress bar ── */
+        .progress-wrap {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px 20px;
+            margin-bottom: 22px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .progress-label { font-size: 0.8rem; color: var(--muted); white-space: nowrap; }
+        .progress-bar-bg {
+            flex: 1;
+            height: 6px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            border-radius: 3px;
+            width: 0%;
+            transition: width 0.4s ease;
+        }
+        .progress-count { font-size: 0.8rem; color: var(--accent2); font-weight: 600; white-space: nowrap; }
+
+        /* ── Question cards ── */
+        .q-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
             margin-bottom: 22px;
             overflow: hidden;
             transition: border-color 0.2s;
         }
-        .question-card:hover { border-color: #a78bfa; }
+        .q-card:hover { border-color: var(--accent2); }
+        .q-card.answered { border-color: #1d4a35; }
 
-        .question-header {
-            background: #0f3460;
-            padding: 12px 20px;
-            font-size: 0.8rem;
-            color: #a78bfa;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            font-weight: 600;
-        }
-        .question-body { padding: 20px; }
-        .question-text { font-size: 1.05rem; color: #e0e0e0; margin-bottom: 16px; line-height: 1.6; }
-
-        textarea.answer-box {
-            background: #0d0d1a;
-            border: 1.5px solid #2d2d5e;
-            border-radius: 8px;
-            color: #e0e0e0;
-            width: 100%;
-            min-height: 120px;
-            padding: 12px 14px;
-            font-size: 0.95rem;
-            resize: vertical;
-            transition: border-color 0.2s;
-            outline: none;
-            display: block;
-        }
-        textarea.answer-box:focus {
-            border-color: #a78bfa;
-            box-shadow: 0 0 0 3px rgba(167,139,250,0.15);
-        }
-        textarea.answer-box::placeholder { color: #555; }
-
-        .char-count {
-            font-size: 0.75rem;
-            color: #666;
-            text-align: right;
-            margin-top: 4px;
-        }
-        .char-count.good { color: #6ee7b7; }
-        .char-count.warn { color: #fcd34d; }
-
-        .submit-bar {
-            background: #16213e;
-            border: 1px solid #2d2d5e;
-            border-radius: 10px;
-            padding: 20px 24px;
+        .q-card-head {
+            background: var(--surface2);
+            padding: 11px 20px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-top: 10px;
         }
-        .submit-bar span { color: #888; font-size: 0.9rem; }
+        .q-num {
+            font-size: 0.7rem;
+            color: var(--accent2);
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-weight: 700;
+        }
+        .q-answered-tag {
+            font-size: 0.7rem;
+            color: var(--success);
+            font-weight: 600;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .q-card.answered .q-answered-tag { opacity: 1; }
+
+        .q-card-body { padding: 18px 20px; }
+        .q-text {
+            font-size: 1rem;
+            color: var(--text);
+            margin-bottom: 14px;
+            line-height: 1.65;
+            font-weight: 500;
+        }
+
+        textarea.answer-box {
+            background: #080c16;
+            border: 1.5px solid var(--border);
+            border-radius: 9px;
+            color: var(--text);
+            width: 100%;
+            min-height: 110px;
+            padding: 12px 14px;
+            font-size: 0.93rem;
+            resize: vertical;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            outline: none;
+            display: block;
+            font-family: inherit;
+        }
+        textarea.answer-box:focus {
+            border-color: var(--accent2);
+            box-shadow: 0 0 0 3px rgba(108,99,255,0.12);
+        }
+        .word-count {
+            font-size: 0.72rem;
+            margin-top: 6px;
+            text-align: right;
+            transition: color 0.3s;
+        }
+        .wc-empty  { color: #4a5568; }
+        .wc-low    { color: var(--warning); }
+        .wc-good   { color: var(--success); }
+
+        /* ── Submit bar ── */
+        .submit-bar {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 18px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-top: 8px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .submit-info { font-size: 0.85rem; color: var(--muted); }
+        .submit-info strong { color: var(--text); }
 
         .btn-submit {
-            background: linear-gradient(135deg, #7c3aed, #a78bfa);
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
             border: none;
             color: #fff;
-            padding: 10px 32px;
-            border-radius: 8px;
-            font-weight: 600;
+            padding: 11px 32px;
+            border-radius: 9px;
+            font-weight: 700;
             font-size: 1rem;
             cursor: pointer;
-            transition: opacity 0.2s, transform 0.1s;
+            transition: opacity 0.2s, transform 0.15s;
+            letter-spacing: 0.3px;
         }
         .btn-submit:hover  { opacity: 0.9; transform: translateY(-1px); }
         .btn-submit:active { transform: translateY(0); }
-        .btn-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-submit:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
-        .ai-note {
-            background: #0f3460;
-            border: 1px solid #1e4a8a;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 20px;
-            font-size: 0.85rem;
-            color: #93c5fd;
-        }
-        .ai-note strong { color: #a78bfa; }
-
-        .submitting-overlay {
-            display: none;
-            position: fixed; top:0; left:0; width:100%; height:100%;
-            background: rgba(0,0,0,0.75);
-            z-index: 9999;
-            align-items: center;
-            justify-content: center;
-            flex-direction: column;
-            color: #fff;
-            font-size: 1.1rem;
-        }
-        .submitting-overlay.active { display: flex; }
-        .spinner {
-            width: 56px; height: 56px;
-            border: 5px solid #333;
-            border-top-color: #a78bfa;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin-bottom: 20px;
-        }
-        .overlay-steps {
-            color: #a0a0c0;
-            font-size: 0.9rem;
-            margin-top: 8px;
+        /* ── Empty state ── */
+        .empty-state {
             text-align: center;
+            padding: 60px 20px;
+            color: var(--muted);
         }
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        .empty-state { text-align: center; padding: 60px 20px; color: #666; }
-
-        .already-submitted {
-            background: #0f3460;
-            border: 1px solid #1e4a8a;
-            border-radius: 10px;
-            padding: 24px;
-            text-align: center;
-            color: #93c5fd;
-        }
-        .already-submitted a { color: #a78bfa; }
+        .empty-state .icon { font-size: 3rem; margin-bottom: 14px; }
     </style>
 </head>
 <body>
 
-<div class="submitting-overlay" id="submitOverlay">
-    <div class="spinner"></div>
-    <span>🤖 Evaluating your answers with AI…</span>
-    <div class="overlay-steps">Using 9-technique NLP analysis — please wait, this may take a moment.</div>
+<!-- ══════════════════════════════════════════════════════
+     EVALUATION OVERLAY
+     Reflects the real parallel architecture:
+     All questions evaluated simultaneously, not one by one.
+     ══════════════════════════════════════════════════════ -->
+<div class="eval-overlay" id="evalOverlay">
+    <div class="eval-box">
+        <div class="spinner-wrap">
+            <div class="spinner-outer"></div>
+            <div class="spinner-inner"></div>
+        </div>
+
+        <div class="eval-title">🤖 Evaluating Your Answers…</div>
+        <div class="eval-sub">
+            All questions are being evaluated <strong>simultaneously</strong> — AI analysis running in parallel for fastest results.
+        </div>
+
+        <div class="speed-badge">
+            ⚡ <strong>Parallel mode</strong> — all {{ questions|length if questions else 'N' }} question(s) at once
+        </div>
+
+        <!-- Phase pills — reflect actual parallel pipeline stages -->
+        <div class="phase-steps">
+            <div class="phase-pill active" id="pill1">🔍 Keywords</div>
+            <div class="phase-pill" id="pill2">📐 TF-IDF</div>
+            <div class="phase-pill" id="pill3">🧠 Semantics</div>
+            <div class="phase-pill" id="pill4">💡 Gemini</div>
+            <div class="phase-pill" id="pill5">📊 Scoring</div>
+        </div>
+
+        <!-- Overall progress bar animates to completion -->
+        <div class="overall-progress">
+            <div class="overall-label">
+                <span>Evaluation progress</span>
+                <span id="pctLabel">0%</span>
+            </div>
+            <div class="progress-track">
+                <div class="progress-fill" id="evalProgressFill"></div>
+            </div>
+        </div>
+
+        <div class="time-hint">
+            Typical wait: <strong>3 – 8 seconds</strong> regardless of question count
+        </div>
+    </div>
 </div>
 
 <nav class="navbar navbar-expand-lg navbar-dark">
@@ -174,55 +430,81 @@
     </div>
 </nav>
 
-<div class="container py-4">
+<div class="container py-2">
 
-    <div class="test-header">
-        <h2>📝 Answer the Questions</h2>
-        <p>Write detailed answers in your own words. The AI evaluates semantic meaning — not just keywords.</p>
+    <div class="page-header">
+        <div>
+            <h2>📝 {{ test_name }}</h2>
+            <p>Write detailed answers — AI understands meaning, not just keywords</p>
+        </div>
+        <a href="{{ url_for('student_take_test') }}" class="btn-back">← Back to Tests</a>
     </div>
 
     {% if questions %}
 
-    <div class="ai-note">
-        <strong>🧠 AI Evaluation Active:</strong>
-        Your answers will be scored using 9 NLP techniques including semantic similarity,
-        keyword analysis, and concept matching. Partial credit is awarded for partially correct answers.
+    <div class="ai-info">
+        <span>🧠</span>
+        <span>
+            <strong>AI Evaluation Active.</strong>
+            Synonyms, paraphrasing, and partial credit are all supported.
+            The more detail you provide, the better your score.
+        </span>
     </div>
 
-    <!-- FIX: form posts to /submit_answers with test_id -->
+    <div class="speed-info">
+        <span>⚡</span>
+        <span>
+            <strong>Parallel evaluation enabled.</strong>
+            All {{ questions|length }} question(s) are scored simultaneously — results typically arrive in 3–8 seconds.
+        </span>
+    </div>
+
+    <!-- Answer progress -->
+    <div class="progress-wrap">
+        <span class="progress-label">Progress</span>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
+        <span class="progress-count" id="progressCount">0 / {{ questions|length }} answered</span>
+    </div>
+
     <form method="POST" action="{{ url_for('submit_answers') }}" id="testForm">
         <input type="hidden" name="test_id" value="{{ test_id }}">
 
-        {% for question in questions %}
-        <div class="question-card" id="card_{{ question[0] }}">
-            <div class="question-header">Question {{ loop.index }} of {{ questions|length }}</div>
-            <div class="question-body">
-                <div class="question-text">{{ question[1] }}</div>
+        {% for q in questions %}
+        <div class="q-card" id="qcard_{{ q[0] }}">
+            <div class="q-card-head">
+                <span class="q-num">Question {{ loop.index }} of {{ questions|length }}</span>
+                <span class="q-answered-tag">✓ Answered</span>
+            </div>
+            <div class="q-card-body">
+                <div class="q-text">{{ q[1] }}</div>
                 <textarea
-                    name="answer_{{ question[0] }}"
-                    id="ans_{{ question[0] }}"
+                    name="answer_{{ q[0] }}"
+                    id="ans_{{ q[0] }}"
                     class="answer-box"
-                    placeholder="Write your answer here — the more detail you provide, the better your score…"
-                    oninput="updateCount(this, {{ question[0] }})"
+                    placeholder="Write your answer here — be as detailed as possible for a better score…"
+                    oninput="onAnswerInput(this, {{ q[0] }}, {{ loop.index0 }})"
                 ></textarea>
-                <div class="char-count" id="count_{{ question[0] }}">0 words — start writing for a better score</div>
+                <div class="word-count wc-empty" id="wc_{{ q[0] }}">Start typing…</div>
             </div>
         </div>
         {% endfor %}
 
         <div class="submit-bar">
-            <span>{{ questions|length }} question(s) — write as much detail as you can</span>
+            <div class="submit-info">
+                <strong>{{ questions|length }}</strong> question(s) —
+                all evaluated simultaneously by AI
+            </div>
             <button type="submit" class="btn-submit" id="submitBtn">
-                Submit &amp; Evaluate ✓
+                Submit &amp; Get Score →
             </button>
         </div>
     </form>
 
     {% else %}
     <div class="empty-state">
-        <div style="font-size:3rem;">📭</div>
-        <h5 style="color:#aaa; margin-top:12px;">No questions found for this test.</h5>
-        <a href="{{ url_for('student_take_test') }}" style="color:#a78bfa;">← Back to tests</a>
+        <div class="icon">📭</div>
+        <h6 style="color:#94a3b8;">No questions found for this test.</h6>
+        <a href="{{ url_for('student_take_test') }}" style="color:var(--accent2);">← Back to tests</a>
     </div>
     {% endif %}
 
@@ -232,27 +514,114 @@
 <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
 <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
 <script>
-    function updateCount(textarea, qid) {
-        const countEl = document.getElementById('count_' + qid);
-        if (!countEl) return;
-        const words = textarea.value.trim() ? textarea.value.trim().split(/\s+/).length : 0;
-        const chars = textarea.value.length;
-        countEl.textContent = words + ' word' + (words !== 1 ? 's' : '') + ' (' + chars + ' characters)';
-        // Color feedback
-        countEl.className = 'char-count';
-        if (words >= 20) countEl.classList.add('good');
-        else if (words >= 5) countEl.classList.add('warn');
+    const totalQs = {{ questions|length }};
+    let answeredSet = new Set();
+
+    function onAnswerInput(ta, qid, idx) {
+        const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+        const chars = ta.value.length;
+        const wc    = document.getElementById('wc_' + qid);
+        const card  = document.getElementById('qcard_' + qid);
+
+        if (words === 0) {
+            wc.textContent = 'Start typing…';
+            wc.className = 'word-count wc-empty';
+        } else if (words < 5) {
+            wc.textContent = `${words} word${words>1?'s':''} — try to be more detailed`;
+            wc.className = 'word-count wc-low';
+        } else {
+            wc.textContent = `${words} words (${chars} chars) ✓`;
+            wc.className = 'word-count wc-good';
+        }
+
+        if (ta.value.trim().length > 0) {
+            answeredSet.add(qid);
+            card.classList.add('answered');
+        } else {
+            answeredSet.delete(qid);
+            card.classList.remove('answered');
+        }
+        updateProgress();
     }
 
+    function updateProgress() {
+        const count = answeredSet.size;
+        const pct   = totalQs > 0 ? (count / totalQs) * 100 : 0;
+        document.getElementById('progressFill').style.width  = pct + '%';
+        document.getElementById('progressCount').textContent = `${count} / ${totalQs} answered`;
+    }
+
+    // ── Overlay animation ────────────────────────────────────────────────────
+    // Accurately reflects the PARALLEL pipeline:
+    // Stages 1-3 (local NLP) complete very fast (~0.5-1s each)
+    // Stage 4 (Gemini) is the bottleneck but runs in parallel with 1-3
+    // Stage 5 (scoring) runs after all threads complete
+    function runOverlayAnimation(numQuestions) {
+        const pills = ['pill1','pill2','pill3','pill4','pill5'];
+        const fill  = document.getElementById('evalProgressFill');
+        const label = document.getElementById('pctLabel');
+
+        // Timing designed for parallel eval:
+        // Local algos ~0.4s each, Gemini ~4-7s, all overlapping
+        // Progress bar reflects real expected completion curve
+        const stages = [
+            { delay: 0,    pct: 5,   active: 0, done: [] },
+            { delay: 400,  pct: 20,  active: 1, done: [0] },
+            { delay: 900,  pct: 38,  active: 2, done: [0, 1] },
+            { delay: 1500, pct: 55,  active: 3, done: [0, 1, 2] },
+            // Gemini is slowest — spend most time here
+            { delay: 3500, pct: 80,  active: 3, done: [0, 1, 2] },
+            { delay: 5500, pct: 92,  active: 4, done: [0, 1, 2, 3] },
+            { delay: 6500, pct: 100, active: -1, done: [0, 1, 2, 3, 4] },
+        ];
+
+        stages.forEach(stage => {
+            setTimeout(() => {
+                // Update active pill
+                pills.forEach((id, i) => {
+                    const el = document.getElementById(id);
+                    el.classList.remove('active', 'done');
+                    if (i === stage.active) el.classList.add('active');
+                    if (stage.done.includes(i)) el.classList.add('done');
+                });
+                // Update progress bar
+                fill.style.width = stage.pct + '%';
+                label.textContent = stage.pct + '%';
+            }, stage.delay);
+        });
+    }
+
+    // Reset overlay if user navigates back (bfcache restore)
+    window.addEventListener('pageshow', function (e) {
+        if (e.persisted) {
+            document.getElementById('evalOverlay').classList.remove('active');
+            const btn = document.getElementById('submitBtn');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Submit & Get Score →';
+            }
+            // Reset pills and bar
+            ['pill1','pill2','pill3','pill4','pill5'].forEach((id, i) => {
+                const el = document.getElementById(id);
+                el.classList.remove('active', 'done');
+                if (i === 0) el.classList.add('active');
+            });
+            const fill = document.getElementById('evalProgressFill');
+            if (fill) { fill.style.width = '0%'; }
+            const label = document.getElementById('pctLabel');
+            if (label) { label.textContent = '0%'; }
+        }
+    });
+
+    // Submit handler
     const form = document.getElementById('testForm');
     if (form) {
-        form.addEventListener('submit', function(e) {
-            // Allow empty answers — they get score 0, don't block submission
-            // Show overlay and disable button
-            document.getElementById('submitOverlay').classList.add('active');
+        form.addEventListener('submit', function() {
+            document.getElementById('evalOverlay').classList.add('active');
             const btn = document.getElementById('submitBtn');
             btn.disabled = true;
             btn.textContent = 'Submitting…';
+            runOverlayAnimation(totalQs);
         });
     }
 </script>

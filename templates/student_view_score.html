@@ -6,195 +6,178 @@
     <title>My Scores — AES_ai</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     <style>
-        body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; }
+        :root {
+            --bg:      #0b0f1a;
+            --surface: #141824;
+            --surf2:   #1c2333;
+            --border:  #2a3245;
+            --accent:  #6c63ff;
+            --acc2:    #a78bfa;
+            --text:    #e2e8f0;
+            --muted:   #8892a4;
+            --green:   #10b981;
+            --yellow:  #f59e0b;
+            --red:     #ef4444;
+        }
+        * { box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text);
+               font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
 
-        .navbar { background: #1e293b !important; border-bottom: 1px solid #334155; }
-        .navbar-brand { color: #a78bfa !important; font-weight: 700; }
-        .nav-link { color: #cbd5e1 !important; }
-        .nav-link:hover { color: #a78bfa !important; }
+        .navbar { background: var(--surface) !important; border-bottom: 1px solid var(--border); }
+        .navbar-brand { color: var(--acc2) !important; font-weight: 700; }
+        .nav-link { color: #94a3b8 !important; }
+        .nav-link:hover, .nav-link.active { color: var(--acc2) !important; }
 
         .page-header {
-            margin: 28px 0 20px;
-            padding: 20px 24px;
-            background: linear-gradient(135deg, #1e293b, #0f172a);
-            border-left: 4px solid #a78bfa;
+            background: linear-gradient(135deg, var(--surf2), var(--surface));
+            border-left: 4px solid var(--accent);
             border-radius: 10px;
+            padding: 18px 24px;
+            margin: 24px 0 20px;
+            display: flex; align-items: center;
+            justify-content: space-between; flex-wrap: wrap; gap: 12px;
         }
-        .page-header h2 { margin: 0; color: #f1f5f9; }
-        .page-header small { color: #94a3b8; font-size: 0.9rem; }
+        .page-header h2 { margin: 0; color: #f1f5f9; font-size: 1.4rem; }
+        .page-header small { color: var(--muted); font-size: 0.85rem; display: block; margin-top: 3px; }
 
+        .btn-back {
+            background: var(--surf2); border: 1px solid var(--border);
+            color: var(--muted); padding: 7px 16px; border-radius: 8px;
+            font-size: 0.85rem; text-decoration: none; transition: all 0.2s;
+        }
+        .btn-back:hover { color: var(--text); border-color: var(--accent); text-decoration: none; }
+
+        /* ── Test card ── */
         .test-card {
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 12px;
-            margin-bottom: 24px;
-            overflow: hidden;
-            transition: border-color 0.2s;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; margin-bottom: 28px; overflow: hidden;
         }
-        .test-card:hover { border-color: #a78bfa; }
-
         .test-card-header {
-            padding: 16px 20px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            border-bottom: 1px solid #334155;
-            background: #16213e;
+            padding: 16px 22px; display: flex; align-items: center;
+            justify-content: space-between; border-bottom: 1px solid var(--border);
+            background: var(--surf2); flex-wrap: wrap; gap: 10px;
         }
         .test-card-header h5 { margin: 0; color: #e2e8f0; font-size: 1.05rem; font-weight: 600; }
 
-        .total-badge {
-            font-size: 0.9rem;
-            font-weight: 700;
-            padding: 5px 16px;
-            border-radius: 20px;
-        }
-        .total-high { background: #065f46; color: #6ee7b7; }
-        .total-mid  { background: #78350f; color: #fcd34d; }
-        .total-low  { background: #450a0a; color: #fca5a5; }
+        .total-badge { font-size: 0.88rem; font-weight: 700;
+                       padding: 5px 16px; border-radius: 20px; }
+        .badge-hi  { background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }
+        .badge-mid { background: #451a03; color: #fcd34d; border: 1px solid #78350f; }
+        .badge-lo  { background: #3b0a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
 
         .test-summary {
-            padding: 12px 20px;
-            background: #0f172a;
-            border-bottom: 1px solid #1e293b;
-            display: flex;
-            gap: 24px;
-            font-size: 0.82rem;
-            color: #64748b;
+            padding: 10px 22px; background: rgba(0,0,0,0.25);
+            border-bottom: 1px solid var(--border);
+            display: flex; gap: 22px; flex-wrap: wrap;
+            font-size: 0.8rem; color: var(--muted);
         }
-        .test-summary span { color: #94a3b8; }
-        .test-summary strong { color: #cbd5e1; }
+        .test-summary strong { color: var(--text); }
 
-        .test-card-body { padding: 0; }
-
+        /* ── Question rows ── */
         .q-row {
-            padding: 18px 20px;
-            border-bottom: 1px solid #1e293b;
-            background: #0f172a;
+            padding: 20px 22px;
+            border-bottom: 1px solid rgba(42,50,69,0.6);
         }
         .q-row:last-child { border-bottom: none; }
-        .q-row:nth-child(even) { background: #111827; }
+        .q-row:nth-child(even) { background: rgba(0,0,0,0.15); }
 
-        .q-number {
-            font-size: 0.7rem;
-            color: #a78bfa;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-weight: 600;
-            margin-bottom: 6px;
+        .q-label {
+            font-size: 0.68rem; color: var(--acc2);
+            text-transform: uppercase; letter-spacing: 1.2px;
+            font-weight: 700; margin-bottom: 7px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .ai-only-tag {
+            font-size: 0.65rem; color: #f59e0b;
+            background: #451a03; border: 1px solid #78350f;
+            border-radius: 4px; padding: 1px 7px; font-weight: 600;
         }
         .q-text {
-            color: #cbd5e1;
-            font-size: 0.95rem;
-            margin-bottom: 12px;
-            font-weight: 500;
-            line-height: 1.5;
+            color: #cbd5e1; font-size: 0.97rem; font-weight: 500;
+            margin-bottom: 14px; line-height: 1.6;
         }
 
-        .answer-cols {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-            margin-bottom: 14px;
+        .answer-grid {
+            display: grid; grid-template-columns: 1fr 1fr;
+            gap: 12px; margin-bottom: 16px;
         }
-        @media (max-width: 640px) { .answer-cols { grid-template-columns: 1fr; } }
+        @media(max-width:640px) { .answer-grid { grid-template-columns: 1fr; } }
 
-        .answer-block {
-            border-radius: 8px;
-            padding: 12px 14px;
-            font-size: 0.85rem;
-            line-height: 1.5;
-        }
-        .answer-expected { background: #0f2744; border: 1px solid #1e3a5f; }
-        .answer-student  { background: #1a1a2e; border: 1px solid #2d2d5e; }
-        .answer-label {
-            font-size: 0.68rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 6px;
-            font-weight: 700;
-        }
-        .label-expected { color: #60a5fa; }
-        .label-student  { color: #a78bfa; }
-        .answer-text { color: #cbd5e1; }
+        .answer-block { border-radius: 9px; padding: 12px 14px;
+                        font-size: 0.85rem; line-height: 1.55; }
+        .ans-expected { background: #0c2240; border: 1px solid #1e3a5f; }
+        .ans-student  { background: #13112a; border: 1px solid #2d2060; }
+        .ans-label { font-size: 0.65rem; text-transform: uppercase;
+                     letter-spacing: 1px; font-weight: 700; margin-bottom: 6px; }
+        .lbl-exp { color: #60a5fa; }
+        .lbl-stu { color: var(--acc2); }
+        .ans-text { color: #c4d0e0; }
 
-        .score-section {
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            padding-top: 4px;
+        /* ── Score row ── */
+        .score-row { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+        .score-circle {
+            width: 50px; height: 50px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 1.1rem; flex-shrink: 0;
+        }
+        .sc-10 { background: #064e3b; color: #6ee7b7; border: 2px solid var(--green); }
+        .sc-hi { background: #064e3b; color: #6ee7b7; }
+        .sc-md { background: #451a03; color: #fcd34d; }
+        .sc-lo { background: #3b0a0a; color: #fca5a5; }
+        .sc-0  { background: var(--surface); color: #6b7280; border: 1px solid var(--border); }
+
+        .score-detail { flex: 1; }
+        .score-bar-bg {
+            height: 7px; background: var(--surf2);
+            border-radius: 4px; overflow: hidden; margin-bottom: 5px;
+        }
+        .score-bar-fill {
+            height: 100%; border-radius: 4px; width: 0%;
+            transition: width 0.9s cubic-bezier(0.4,0,0.2,1);
+        }
+        .bar-10  { background: linear-gradient(90deg, var(--green), #6ee7b7); }
+        .bar-hi  { background: var(--green); }
+        .bar-mid { background: var(--yellow); }
+        .bar-low { background: var(--red); }
+        .bar-0   { background: #374151; }
+
+        .score-meta { display: flex; justify-content: space-between; font-size: 0.74rem; }
+        .verdict { font-weight: 700; }
+        .v-perfect   { color: #6ee7b7; }
+        .v-excellent { color: #6ee7b7; }
+        .v-good      { color: #86efac; }
+        .v-partial   { color: #fcd34d; }
+        .v-weak      { color: #fca5a5; }
+        .v-zero      { color: #6b7280; }
+
+        /* ── Feedback block ── */
+        .feedback-block {
+            background: #0d1120; border: 1px solid #2a3245;
+            border-radius: 8px; padding: 11px 14px;
+            font-size: 0.83rem; color: #94a3b8; line-height: 1.6;
+        }
+        .fb-label {
+            font-size: 0.64rem; color: var(--acc2);
+            text-transform: uppercase; letter-spacing: 1px;
+            font-weight: 700; margin-bottom: 5px;
         }
 
-        .score-pill {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 48px; height: 48px;
-            border-radius: 50%;
-            font-weight: 800;
-            font-size: 1.05rem;
-            flex-shrink: 0;
-        }
-        .score-10 { background: #065f46; color: #6ee7b7; border: 2px solid #10b981; }
-        .score-hi { background: #065f46; color: #6ee7b7; }
-        .score-md { background: #78350f; color: #fcd34d; }
-        .score-lo { background: #4c1d1d; color: #fca5a5; }
-        .score-0  { background: #1e293b; color: #6b7280; border: 1px solid #334155; }
+        /* ── Key points ── */
+        .kp-wrap { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+        .kp-tag { font-size: 0.72rem; padding: 3px 9px; border-radius: 20px; font-weight: 500; }
+        .kp-covered { background: #064e3b; color: #6ee7b7; }
+        .kp-missing { background: #3b0a0a; color: #fca5a5; }
 
-        .score-right { flex: 1; }
-        .score-bar-wrap {
-            height: 8px;
-            background: #1e293b;
-            border-radius: 4px;
-            margin-bottom: 4px;
-            overflow: hidden;
-        }
-        .score-bar {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.8s ease;
-        }
-        .bar-10 { background: linear-gradient(90deg, #10b981, #6ee7b7); }
-        .bar-hi { background: #10b981; }
-        .bar-md { background: #f59e0b; }
-        .bar-lo { background: #ef4444; }
-        .bar-0  { background: #374151; }
-
-        .score-label {
-            font-size: 0.75rem;
-            color: #64748b;
-            display: flex;
-            justify-content: space-between;
-        }
-        .score-label .verdict {
-            font-weight: 600;
-        }
-        .verdict-excellent { color: #6ee7b7; }
-        .verdict-good      { color: #86efac; }
-        .verdict-partial   { color: #fcd34d; }
-        .verdict-weak      { color: #fca5a5; }
-        .verdict-zero      { color: #6b7280; }
-
-        .no-tests {
-            text-align: center;
-            padding: 60px 20px;
-            color: #475569;
-        }
-        .no-tests div { font-size: 3rem; margin-bottom: 12px; }
-
-        .retake-btn {
-            display: inline-block;
-            margin-top: 16px;
-            padding: 8px 20px;
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 8px;
-            color: #a78bfa;
-            font-size: 0.85rem;
+        .retake-link {
+            display: inline-block; margin-top: 10px; padding: 7px 18px;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 8px; color: var(--acc2); font-size: 0.85rem;
             text-decoration: none;
-            transition: background 0.2s;
         }
-        .retake-btn:hover { background: #253047; color: #a78bfa; text-decoration: none; }
+        .retake-link:hover { background: var(--surf2); color: var(--acc2); text-decoration: none; }
+
+        .empty-state { text-align: center; padding: 70px 20px; color: var(--muted); }
+        .empty-state .icon { font-size: 3.2rem; margin-bottom: 14px; }
     </style>
 </head>
 <body>
@@ -214,148 +197,159 @@
     </div>
 </nav>
 
-<div class="container py-4">
+<div class="container py-2">
 
     <div class="page-header">
-        <h2>📊 My Results</h2>
-        <small>AI-evaluated scores using 9-technique NLP analysis.</small>
+        <div>
+            <h2>📊 My Results</h2>
+            <small>AI-evaluated — semantic analysis, synonym matching, concept coverage</small>
+        </div>
+        <a href="{{ url_for('student_take_test') }}" class="btn-back">← Take a Test</a>
     </div>
 
-    {% set ns = namespace(has_scores=false) %}
+    {% if student_scores %}
 
-    {% for test_score in student_scores %}
-        {% set ns.has_scores = true %}
+        {% for test_score in student_scores %}
+            {% set got   = test_score.total_score %}
+            {% set mx    = test_score.max_score %}
+            {% set pct   = ((got / mx * 100) | int) if mx > 0 else 0 %}
+            {% set num_q = test_score.scores | length %}
 
-        {% set parts = test_score.total_score.split(' / ') %}
-        {% set got = parts[0]|int %}
-        {% set max = parts[1]|int if parts|length > 1 else 10 %}
-        {% set pct = (got / max * 100)|int if max > 0 else 0 %}
-        {% set num_questions = test_score.scores|length %}
+            <div class="test-card">
+                <div class="test-card-header">
+                    <h5>📋 {{ test_score.test_name }}</h5>
+                    <span class="total-badge
+                        {% if pct >= 70 %}badge-hi
+                        {% elif pct >= 40 %}badge-mid
+                        {% else %}badge-lo{% endif %}">
+                        {{ got }} / {{ mx }} &nbsp;({{ pct }}%)
+                    </span>
+                </div>
 
-        <div class="test-card">
-            <div class="test-card-header">
-                <h5>📋 {{ test_score.test_name }}</h5>
-                <span class="total-badge
-                    {% if pct >= 70 %}total-high
-                    {% elif pct >= 40 %}total-mid
-                    {% else %}total-low{% endif %}">
-                    {{ test_score.total_score }} &nbsp;({{ pct }}%)
-                </span>
-            </div>
+                <div class="test-summary">
+                    <span>Questions: <strong>{{ num_q }}</strong></span>
+                    <span>Total: <strong>{{ got }} / {{ mx }}</strong></span>
+                    <span>Average: <strong>{{ ((got / num_q) | round(1)) if num_q > 0 else 0 }} / 10</strong></span>
+                    <span>Grade:
+                        <strong>
+                            {% if pct >= 90 %}A+
+                            {% elif pct >= 80 %}A
+                            {% elif pct >= 70 %}B
+                            {% elif pct >= 60 %}C
+                            {% elif pct >= 50 %}D
+                            {% else %}F{% endif %}
+                        </strong>
+                    </span>
+                </div>
 
-            <div class="test-summary">
-                <span>Questions: <strong>{{ num_questions }}</strong></span>
-                <span>Total: <strong>{{ got }} / {{ max }}</strong></span>
-                <span>Average: <strong>{{ (got / num_questions)|round(1) if num_questions > 0 else 0 }} / 10</strong></span>
-                <span>Grade:
-                    <strong>
-                        {% if pct >= 90 %}A+
-                        {% elif pct >= 80 %}A
-                        {% elif pct >= 70 %}B
-                        {% elif pct >= 60 %}C
-                        {% elif pct >= 50 %}D
-                        {% else %}F{% endif %}
-                    </strong>
-                </span>
-            </div>
+                {% for item in test_score.scores %}
+                    {% set s = item.score %}
 
-            <div class="test-card-body">
-                {% for score in test_score.scores %}
-
-                {% set s = score.score %}
-
-                {% if s == 10 %}
-                    {% set verdict = "Perfect Answer" %}
-                    {% set verdict_class = "verdict-excellent" %}
-                    {% set pill_class = "score-10" %}
-                    {% set bar_class = "bar-10" %}
-                {% elif s >= 8 %}
-                    {% set verdict = "Excellent" %}
-                    {% set verdict_class = "verdict-excellent" %}
-                    {% set pill_class = "score-hi" %}
-                    {% set bar_class = "bar-hi" %}
-                {% elif s >= 6 %}
-                    {% set verdict = "Good" %}
-                    {% set verdict_class = "verdict-good" %}
-                    {% set pill_class = "score-hi" %}
-                    {% set bar_class = "bar-hi" %}
-                {% elif s >= 4 %}
-                    {% set verdict = "Partial" %}
-                    {% set verdict_class = "verdict-partial" %}
-                    {% set pill_class = "score-md" %}
-                    {% set bar_class = "bar-md" %}
-                {% elif s >= 2 %}
-                    {% set verdict = "Weak" %}
-                    {% set verdict_class = "verdict-weak" %}
-                    {% set pill_class = "score-lo" %}
-                    {% set bar_class = "bar-lo" %}
-                {% elif s == 1 %}
-                    {% set verdict = "Minimal" %}
-                    {% set verdict_class = "verdict-weak" %}
-                    {% set pill_class = "score-lo" %}
-                    {% set bar_class = "bar-lo" %}
-                {% else %}
-                    {% set verdict = "No Credit" %}
-                    {% set verdict_class = "verdict-zero" %}
-                    {% set pill_class = "score-0" %}
-                    {% set bar_class = "bar-0" %}
-                {% endif %}
+                    {% if s == 10 %}
+                        {% set verdict = "Perfect" %}  {% set vc = "v-perfect" %}
+                        {% set sc_cls = "sc-10" %}     {% set bar = "bar-10" %}
+                    {% elif s >= 8 %}
+                        {% set verdict = "Excellent" %} {% set vc = "v-excellent" %}
+                        {% set sc_cls = "sc-hi" %}      {% set bar = "bar-hi" %}
+                    {% elif s >= 6 %}
+                        {% set verdict = "Good" %}      {% set vc = "v-good" %}
+                        {% set sc_cls = "sc-hi" %}      {% set bar = "bar-hi" %}
+                    {% elif s >= 4 %}
+                        {% set verdict = "Partial" %}   {% set vc = "v-partial" %}
+                        {% set sc_cls = "sc-md" %}      {% set bar = "bar-mid" %}
+                    {% elif s >= 2 %}
+                        {% set verdict = "Weak" %}      {% set vc = "v-weak" %}
+                        {% set sc_cls = "sc-lo" %}      {% set bar = "bar-low" %}
+                    {% elif s == 1 %}
+                        {% set verdict = "Minimal" %}   {% set vc = "v-weak" %}
+                        {% set sc_cls = "sc-lo" %}      {% set bar = "bar-low" %}
+                    {% else %}
+                        {% set verdict = "No Credit" %} {% set vc = "v-zero" %}
+                        {% set sc_cls = "sc-0" %}        {% set bar = "bar-0" %}
+                    {% endif %}
 
                 <div class="q-row">
-                    <div class="q-number">Question {{ loop.index }} of {{ test_score.scores|length }}</div>
-                    <div class="q-text">{{ score.question }}</div>
+                    <div class="q-label">
+                        Question {{ loop.index }} of {{ num_q }}
+                        {% if not item.expected_answer %}
+                            <span class="ai-only-tag">⚡ AI knowledge evaluation</span>
+                        {% endif %}
+                    </div>
+                    <div class="q-text">{{ item.question }}</div>
 
-                    <div class="answer-cols">
-                        <div class="answer-block answer-expected">
-                            <div class="answer-label label-expected">📚 Expected Answer</div>
-                            <div class="answer-text">{{ score.expected_answer }}</div>
-                        </div>
-                        <div class="answer-block answer-student">
-                            <div class="answer-label label-student">✏️ Your Answer</div>
-                            <div class="answer-text">
-                                {% if score.student_answer %}
-                                    {{ score.student_answer }}
+                    <div class="answer-grid">
+                        <div class="answer-block ans-expected">
+                            <div class="ans-label lbl-exp">📚 Expected Answer</div>
+                            <div class="ans-text">
+                                {% if item.expected_answer %}
+                                    {{ item.expected_answer }}
                                 {% else %}
-                                    <em style="color:#6b7280;">No answer submitted</em>
+                                    <em style="color:#6b7280;">No expected answer on file — evaluated by AI knowledge</em>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <div class="answer-block ans-student">
+                            <div class="ans-label lbl-stu">✏️ Your Answer</div>
+                            <div class="ans-text">
+                                {% if item.student_answer %}
+                                    {{ item.student_answer }}
+                                {% else %}
+                                    <em style="color:#4a5568;">No answer submitted</em>
                                 {% endif %}
                             </div>
                         </div>
                     </div>
 
-                    <div class="score-section">
-                        <span class="score-pill {{ pill_class }}">{{ s }}</span>
-                        <div class="score-right">
-                            <div class="score-bar-wrap">
-                                <div class="score-bar {{ bar_class }}"
-                                     style="width: {{ s * 10 }}%"
-                                     data-score="{{ s }}"></div>
+                    <!-- Score bar -->
+                    <div class="score-row">
+                        <span class="score-circle {{ sc_cls }}">{{ s }}</span>
+                        <div class="score-detail">
+                            <div class="score-bar-bg">
+                                <div class="score-bar-fill {{ bar }}"
+                                     data-target="{{ s * 10 }}%"
+                                     style="width:0%"></div>
                             </div>
-                            <div class="score-label">
-                                <span class="verdict {{ verdict_class }}">{{ verdict }}</span>
-                                <span>{{ s }} / 10</span>
+                            <div class="score-meta">
+                                <span class="verdict {{ vc }}">{{ verdict }}</span>
+                                <span style="color:var(--muted);">{{ s }} / 10</span>
                             </div>
                         </div>
                     </div>
+
+                    <!-- AI Feedback -->
+                    {% if item.feedback %}
+                    <div class="feedback-block">
+                        <div class="fb-label">🤖 AI Feedback</div>
+                        {{ item.feedback }}
+                    </div>
+                    {% endif %}
                 </div>
-
                 {% endfor %}
+
             </div>
+
+            <div style="text-align:right; margin-top:-18px; margin-bottom:28px;">
+                <a href="{{ url_for('student_take_test') }}" class="retake-link">🔄 Retake a Test</a>
+            </div>
+
+        {% endfor %}
+
+    {% else %}
+        <div class="empty-state">
+            <div class="icon">📭</div>
+            <h5 style="color:#94a3b8;">No results yet</h5>
+            <p style="font-size:0.9rem; color:var(--muted);">
+                Take a test and your AI-evaluated scores will appear here.
+            </p>
+            <a href="{{ url_for('student_take_test') }}" style="color:var(--acc2); font-weight:600;">
+                Take a Test →
+            </a>
         </div>
-
-        <div style="text-align:right; margin-top:-16px; margin-bottom:24px;">
-            <a href="{{ url_for('student_take_test') }}" class="retake-btn">🔄 Retake a Test</a>
-        </div>
-
-    {% endfor %}
-
-    {% if not ns.has_scores %}
-    <div class="no-tests">
-        <div>📭</div>
-        <h5 style="color:#94a3b8;">No test results yet.</h5>
-        <p style="color:#64748b; font-size:0.9rem;">Take a test and your AI-evaluated scores will appear here.</p>
-        <a href="{{ url_for('student_take_test') }}" style="color:#a78bfa; font-weight:600;">Take a Test →</a>
-    </div>
     {% endif %}
+
+    <div class="mt-2 mb-4">
+        <a href="{{ url_for('student_home') }}" class="btn-back">← Back to Home</a>
+    </div>
 
 </div>
 
@@ -363,13 +357,12 @@
 <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
 <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
 <script>
-    // Animate score bars on load
     window.addEventListener('load', function () {
-        document.querySelectorAll('.score-bar').forEach(function (bar) {
-            const target = bar.style.width;
-            bar.style.width = '0%';
-            setTimeout(function () { bar.style.width = target; }, 100);
-        });
+        setTimeout(function () {
+            document.querySelectorAll('.score-bar-fill').forEach(function (bar) {
+                bar.style.width = bar.getAttribute('data-target');
+            });
+        }, 200);
     });
 </script>
 </body>

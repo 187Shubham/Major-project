@@ -3,158 +3,286 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Teacher View Scores</title>
+    <title>Student Scores — Teacher View</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     <style>
-        /* Skeleton Loader CSS */
-        @keyframes loading {
-            40% {
-                background-position: 100% 0;
-            }
-            100% {
-                background-position: 100% 0;
-            }
-        }
+        body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; }
 
-        .loading .bar {
-            background-color: #E7E7E7;
-            height: 14px;
-            border-radius: 7px;
-            width: 80%;
-        }
+        .navbar { background: #1e293b !important; border-bottom: 1px solid #334155; }
+        .navbar-brand { color: #a78bfa !important; font-weight: 700; }
+        .nav-link { color: #cbd5e1 !important; }
+        .nav-link:hover { color: #a78bfa !important; }
 
-        .loading:after {
-            position: absolute;
-            transform: translateY(-50%);
-            top: 50%;
-            left: 0;
-            content: "";
-            display: block;
-            width: 100%;
-            height: 24px;
-            background-image: linear-gradient(100deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.5) 60%, rgba(255, 255, 255, 0) 80%);
-            background-size: 200px 24px;
-            background-position: -100px 0;
-            background-repeat: no-repeat;
-            animation: loading 1s infinite;
+        .page-header {
+            margin: 28px 0 22px;
+            padding: 18px 24px;
+            background: linear-gradient(135deg, #1e293b, #0f172a);
+            border-left: 4px solid #a78bfa;
+            border-radius: 10px;
         }
+        .page-header h2 { margin: 0; font-size: 1.5rem; }
+        .page-header small { color: #94a3b8; font-size: 0.88rem; }
+
+        /* Student cards (outer) */
+        .student-card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        .student-card-header {
+            background: #0f172a;
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.2s;
+        }
+        .student-card-header:hover { background: #1a2744; }
+        .student-name { font-size: 1rem; font-weight: 600; color: #e2e8f0; }
+        .student-meta { font-size: 0.78rem; color: #94a3b8; margin-top: 2px; }
+        .toggle-icon { color: #a78bfa; font-size: 1.2rem; transition: transform 0.25s; }
+        .student-body { display: none; }
+        .student-body.open { display: block; }
+        .toggle-icon.open { transform: rotate(180deg); }
+
+        /* Test sub-sections */
+        .test-section {
+            border-bottom: 1px solid #334155;
+            padding: 14px 20px;
+        }
+        .test-section:last-child { border-bottom: none; }
+        .test-title {
+            font-size: 0.82rem;
+            color: #a78bfa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .test-total {
+            font-size: 0.8rem;
+            padding: 3px 12px;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+        .tt-hi  { background: #064e3b; color: #6ee7b7; }
+        .tt-mid { background: #451a03; color: #fcd34d; }
+        .tt-lo  { background: #3b0a0a; color: #fca5a5; }
+
+        /* Q rows inside test */
+        .q-row {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 10px;
+        }
+        .q-num {
+            font-size: 0.65rem; color: #64748b;
+            text-transform: uppercase; letter-spacing: 1px;
+            margin-bottom: 5px; display: flex; gap: 8px; align-items: center;
+        }
+        .ai-tag {
+            font-size: 0.62rem; color: #f59e0b; background: #451a03;
+            border: 1px solid #78350f; border-radius: 4px; padding: 1px 6px;
+        }
+        .q-text { color: #cbd5e1; font-size: 0.92rem; font-weight: 500; margin-bottom: 10px; }
+
+        .ans-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+        @media(max-width:600px){ .ans-grid { grid-template-columns: 1fr; } }
+
+        .ans-block { border-radius: 7px; padding: 9px 12px; font-size: 0.82rem; }
+        .ans-exp { background: #0c2240; border: 1px solid #1e3a5f; }
+        .ans-stu { background: #13112a; border: 1px solid #2d2060; }
+        .a-lbl { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 1px;
+                 font-weight: 700; margin-bottom: 4px; }
+        .lbl-e { color: #60a5fa; }
+        .lbl-s { color: #a78bfa; }
+        .a-txt { color: #c4d0e0; line-height: 1.5; }
+
+        .score-line { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .sc { width: 38px; height: 38px; border-radius: 50%;
+              display: flex; align-items: center; justify-content: center;
+              font-weight: 800; font-size: 0.95rem; flex-shrink: 0; }
+        .sc-10 { background: #064e3b; color: #6ee7b7; border: 2px solid #10b981; }
+        .sc-hi { background: #064e3b; color: #6ee7b7; }
+        .sc-md { background: #451a03; color: #fcd34d; }
+        .sc-lo { background: #3b0a0a; color: #fca5a5; }
+        .sc-0  { background: #1e293b; color: #6b7280; border: 1px solid #334155; }
+        .sc-label { color: #94a3b8; font-size: 0.8rem; }
+
+        .fb-block {
+            background: #0a0e1a; border: 1px solid #1e293b; border-radius: 7px;
+            padding: 9px 12px; font-size: 0.8rem; color: #94a3b8; line-height: 1.55;
+        }
+        .fb-lbl { font-size: 0.62rem; color: #a78bfa; text-transform: uppercase;
+                  letter-spacing: 1px; font-weight: 700; margin-bottom: 4px; }
+
+        .empty-state { text-align: center; padding: 60px 20px; color: #475569; }
     </style>
 </head>
 <body>
 
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
-        <a class="navbar-brand" href="{{ url_for('teacher_home') }}">Teacher Panel</a>
-        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
-            <span class="navbar-toggler-icon"></span>
-        </button>
-        <div class="collapse navbar-collapse" id="navbarNav">
-            <ul class="navbar-nav ml-auto">
-                <li class="nav-item active">
-                    <a class="nav-link" href="{{ url_for('teacher_home') }}">Home <span class="sr-only">(current)</span></a>
-                </li>
-                <li class="nav-item active">
-                    <a class="nav-link" href="{{ url_for('teacher_view_score') }}">Score <span class="sr-only">(current)</span></a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link" href="{{ url_for('teacher_logout') }}">Logout</a>
-                </li>
-            </ul>
-        </div>
-    </nav>
+<nav class="navbar navbar-expand-lg navbar-dark">
+    <a class="navbar-brand" href="{{ url_for('teacher_home') }}">AES_ai</a>
+    <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav">
+        <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="navbarNav">
+        <ul class="navbar-nav ml-auto">
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('teacher_home') }}">Home</a></li>
+            <li class="nav-item"><a class="nav-link active" href="{{ url_for('teacher_view_score') }}">Student Scores</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('teacher_logout') }}">Logout</a></li>
+        </ul>
+    </div>
+</nav>
 
-    <div class="container my-5">
-        <h1 class="text-center mb-4">Student Scores</h1>
-        <div class="row">
-            {% for student_id, student_data in student_scores.items() %}
-            <div class="col-md-6 mb-4">
-                <div class="card bg-dark text-white"> <!-- Add bg-dark and text-white classes for dark theme -->
-                    <div class="card-body">
-                        <h5 class="card-title">
-                            <a href="#" data-toggle="modal" data-target="#studentModal-{{ student_id }}">
-                                {{ student_data.student_username }}
-                            </a>
-                            
-                        </h5>
+<div class="container py-3">
+
+    <div class="page-header">
+        <h2>📊 Student Scores</h2>
+        <small>Click a student card to expand their test results.</small>
+    </div>
+
+    {% if student_scores %}
+        {% for student_id, student_data in student_scores.items() %}
+
+            {# Compute overall total for this student #}
+            {% set ns = namespace(grand=0, grand_max=0) %}
+            {% for tname, items in student_data.tests.items() %}
+                {% for item in items %}
+                    {% set ns.grand = ns.grand + item.score %}
+                    {% set ns.grand_max = ns.grand_max + 10 %}
+                {% endfor %}
+            {% endfor %}
+            {% set overall_pct = ((ns.grand / ns.grand_max * 100) | int) if ns.grand_max > 0 else 0 %}
+
+        <div class="student-card">
+            <div class="student-card-header" onclick="toggleStudent('s{{ student_id }}')">
+                <div>
+                    <div class="student-name">👤 {{ student_data.student_username }}</div>
+                    <div class="student-meta">
+                        {{ ns.grand }} / {{ ns.grand_max }} total &nbsp;·&nbsp;
+                        {{ overall_pct }}% overall &nbsp;·&nbsp;
+                        {{ student_data.tests | length }} test(s)
                     </div>
                 </div>
+                <span class="toggle-icon" id="icon_s{{ student_id }}">▾</span>
             </div>
-            <!-- Modal -->
-            <!-- Modal -->
-<div class="modal fade" id="studentModal-{{ student_id }}" tabindex="-1" role="dialog" aria-labelledby="studentModalLabel-{{ student_id }}" aria-hidden="true">
-    <div class="modal-dialog modal-lg" role="document">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" id="studentModalLabel-{{ student_id }}">{{ student_data.student_username }} Scores</h5>
-                <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-                    <span aria-hidden="true">&times;</span>
-                </button>
-            </div>
-            <div class="modal-body">
-                {% for test_name, scores in student_data.tests.items() %}
-                <div class="card bg-dark text-white mb-4">
-                    <div class="card-body">
-                        <h6 class="card-subtitle mb-2 text-muted" data-toggle="collapse" data-target="#testCollapse-{{ student_id }}-{{ loop.index }}">{{ test_name }}</h6>
 
-<div class="collapse" id="testCollapse-{{ student_id }}-{{ loop.index }}">
-    <table class="table table-striped">
-        <thead>
-            <tr>
-                <th>Question</th>
-                <th>Expected Answer</th>
-                <th>Student Answer</th>
-                <th>Score</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for score in scores %}
-            <tr class="data-row bg-dark text-white">
-                <td>{{ score.question_text }}</td>
-                <td>{{ score.expected_answer }}</td>
-                <td>{{ score.student_answer }}</td>
-                <td>{{ score.score }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    <div class="text-right">
-        <strong>Total Score: {{ scores|sum(attribute='score') }}</strong>
-    </div>
-</div>
+            <div class="student-body" id="body_s{{ student_id }}">
+                {% for test_name, items in student_data.tests.items() %}
+                    {% set ns2 = namespace(total=0) %}
+                    {% for item in items %}
+                        {% set ns2.total = ns2.total + item.score %}
+                    {% endfor %}
+                    {% set max2 = items | length * 10 %}
+                    {% set pct2 = ((ns2.total / max2 * 100) | int) if max2 > 0 else 0 %}
 
+                <div class="test-section">
+                    <div class="test-title">
+                        📋 {{ test_name }}
+                        <span class="test-total
+                            {% if pct2 >= 70 %}tt-hi
+                            {% elif pct2 >= 40 %}tt-mid
+                            {% else %}tt-lo{% endif %}">
+                            {{ ns2.total }} / {{ max2 }} ({{ pct2 }}%)
+                        </span>
                     </div>
+
+                    {% for item in items %}
+                        {% set s = item.score %}
+                        {% if s == 10 %}{% set sc_cls = "sc-10" %}
+                        {% elif s >= 7 %}{% set sc_cls = "sc-hi" %}
+                        {% elif s >= 4 %}{% set sc_cls = "sc-md" %}
+                        {% elif s >= 1 %}{% set sc_cls = "sc-lo" %}
+                        {% else %}{% set sc_cls = "sc-0" %}{% endif %}
+
+                    <div class="q-row">
+                        <div class="q-num">
+                            Q{{ loop.index }}
+                            {% if not item.expected_answer %}
+                                <span class="ai-tag">⚡ AI-only</span>
+                            {% endif %}
+                        </div>
+                        <div class="q-text">{{ item.question_text }}</div>
+
+                        <div class="ans-grid">
+                            <div class="ans-block ans-exp">
+                                <div class="a-lbl lbl-e">📚 Expected</div>
+                                <div class="a-txt">
+                                    {% if item.expected_answer %}
+                                        {{ item.expected_answer }}
+                                    {% else %}
+                                        <em style="color:#475569;">None — AI knowledge used</em>
+                                    {% endif %}
+                                </div>
+                            </div>
+                            <div class="ans-block ans-stu">
+                                <div class="a-lbl lbl-s">✏️ Student</div>
+                                <div class="a-txt">
+                                    {% if item.student_answer %}
+                                        {{ item.student_answer }}
+                                    {% else %}
+                                        <em style="color:#475569;">No answer</em>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="score-line">
+                            <span class="sc {{ sc_cls }}">{{ s }}</span>
+                            <span class="sc-label">{{ s }} / 10</span>
+                        </div>
+
+                        {% if item.feedback %}
+                        <div class="fb-block">
+                            <div class="fb-lbl">🤖 AI Feedback</div>
+                            {{ item.feedback }}
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+
                 </div>
                 {% endfor %}
             </div>
         </div>
-    </div>
-</div>
-<!-- End Modal -->
 
-            </div>
-            <!-- End Modal -->
-            {% endfor %}
+        {% endfor %}
+    {% else %}
+        <div class="empty-state">
+            <div style="font-size:3rem; margin-bottom:12px;">📭</div>
+            <h5 style="color:#94a3b8;">No student submissions yet.</h5>
+            <p style="color:#475569;">Once students submit answers, their scores appear here.</p>
         </div>
-    </div>
+    {% endif %}
 
-    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
-    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
-    <script>
-        $(document).ready(function() {
-            // Show actual data and hide loader rows when modal is shown
-            $('.modal').on('shown.bs.modal', function (e) {
-                var modal = $(this);
-                modal.find('.skeleton-row').hide();
-                modal.find('.data-row').show();
-            });
-            
-            // Hide data rows and show loader rows when modal is hidden
-            $('.modal').on('hidden.bs.modal', function (e) {
-                var modal = $(this);
-                modal.find('.skeleton-row').show();
-                modal.find('.data-row').hide();
-            });
-        });
-    </script>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+<script>
+    function toggleStudent(id) {
+        var body = document.getElementById('body_' + id);
+        var icon = document.getElementById('icon_' + id);
+        var isOpen = body.classList.contains('open');
+        if (isOpen) {
+            body.classList.remove('open');
+            icon.classList.remove('open');
+        } else {
+            body.classList.add('open');
+            icon.classList.add('open');
+        }
+    }
+</script>
 </body>
 </html>
