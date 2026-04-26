@@ -1,39 +1,61 @@
 """
-ai_evaluator.py — Industry-Grade Hybrid Answer Evaluation Pipeline
-==================================================================
-ARCHITECTURE:
-  User Answer
-      │
-      ▼
-  1. Text Normalizer      ← fixes spaces, case, punctuation, abbreviations
-      │
-      ▼
-  2. Exact Match          ← short-circuit: identical after normalisation → 10/10
-      │
-      ▼
-  3. Keyword Overlap      ← stop-word filtered, lemmatized, length-penalised
-      │
-      ▼
-  4. Semantic Similarity  ← MiniLM embeddings (precomputed + cached per question)
-      │
-      ▼
-  5. Gemini AI (optional) ← dominant signal when API key is set; strict timeout
-      │
-      ▼
-  6. Weighted Fusion      ← semantic dominates local; Gemini dominates all
-      │
-      ▼
-  7. Threshold → Score    ← tiered floors, graceful fallback, 0–10 output
+ai_evaluator.py  ─  Hybrid Answer Evaluation Engine
+=====================================================
+Pipeline (every student answer goes through this):
 
-FIXES over previous version:
-  - Abbreviation expansion ("SQL" → "Structured Query Language") before any scoring
-  - Space normalisation ("data base" → "database") using compound-word collapse
-  - TF-IDF weight reduced from 0.18 → 0.10 (was causing over-scoring on n-gram matches)
-  - Semantic similarity now dominates local pipeline (weight: 0.42)
-  - Precomputed embedding cache with LRU eviction (thread-safe, per question_id)
-  - Every technique wrapped in its own try/except — one failure can't kill the score
-  - Fallback chain: Gemini → local semantic → TF-IDF → keyword → heuristic
-  - Score thresholds recalibrated: 0.85+ → 10, 0.70+ → 8-9, etc.
+    Raw Text
+       │
+       ▼
+  [1] NORMALISE          lower + abbrev-expand + compound-collapse + strip punct
+       │
+       ▼
+  [2] EXACT MATCH        normalised strings identical → 10 immediately
+       │
+       ▼
+  [3] CONCEPT COVERAGE   which required concepts did student mention?  (0–1)
+       │                  ← domain detected from question text
+       ▼
+  [4] KEYWORD RECALL     overlap of meaningful tokens, NO length penalty  (0–1)
+       │
+       ▼
+  [5] SYNONYM MATCH      token-level + built-in groups + optional WordNet  (0–1)
+       │
+       ▼
+  [6] TF-IDF COSINE      bigram surface similarity (supporting only)       (0–1)
+       │
+       ▼
+  [7] SEMANTIC SIM       MiniLM sentence embeddings (cached per question)  (0–1)
+       │
+       ▼
+  [8] GEMINI (optional)  meaning-level AI evaluation with timeout guard    (0–1)
+       │
+       ▼
+  [9] WEIGHTED FUSION    concept_coverage dominates locally; Gemini when live
+       │
+       ▼
+  [10] SCORE             integer 0–10 with human-readable feedback
+
+ROOT CAUSES FIXED IN THIS VERSION
+──────────────────────────────────
+Fix A ─ Semantic weak / structure-penalised
+  Problem: _synonym_match split multi-word synonyms into tokens then looked up
+           each token separately.  "real time entity" became {"real","time","entity"}
+           and none matched "instance".
+  Fix:     _phrase_match() checks full normalised text for multi-word synonyms
+           BEFORE falling back to token-level matching.
+
+Fix B ─ Length bias
+  Problem: keyword_match applied stu_len/exp_len ratio as 20% of score, so a
+           shorter correct answer was penalised purely for word count.
+  Fix:     keyword_match now measures RECALL only (how many expected tokens
+           the student covered).  Length is never penalised — only coverage matters.
+
+Fix C ─ Concept coverage not wired into with-expected pipeline
+  Problem: _concept_coverage_score existed but was only called from
+           _evaluate_without_expected.  Q1 (has expected) never got concept boost.
+  Fix:     _evaluate_with_expected now calls _concept_coverage_score and uses
+           the ratio as an additive floor on content_signal so a student who
+           correctly names all required concepts cannot score below that floor.
 """
 
 import os
@@ -43,286 +65,748 @@ import hashlib
 import time
 import logging
 import threading
-from functools import lru_cache
-from typing import Optional
+from typing import Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-1.5-flash"
-MAX_RETRIES    = 2
-RETRY_DELAY    = 1
-GEMINI_TIMEOUT = 10          # seconds before falling back to local pipeline
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL    = "gemini-1.5-flash"
+MAX_RETRIES     = 2
+RETRY_DELAY     = 1
+GEMINI_TIMEOUT  = 10          # seconds
 
-# Embedding cache: question_id → numpy vector (avoids re-encoding expected answers)
 _embedding_cache: dict = {}
 _embedding_lock  = threading.Lock()
-EMBEDDING_CACHE_MAX = 500    # evict oldest when limit reached
+EMBEDDING_CACHE_MAX = 500
 
-# Result cache: sha256(expected+student+question) → final result dict
 _eval_cache: dict = {}
 _cache_lock = threading.Lock()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 1 — TEXT NORMALISATION
-# Handles the root causes of unfair scoring:
-#   • "data base" vs "database"   → collapse then compare
-#   • "SQL" vs "Structured Query Language" → expand abbreviations first
-#   • trailing punctuation, extra spaces, mixed case
+# [1]  NORMALISATION
+#      Single entry point used by every technique below.
+#      Guarantees: "SQL"="structured query language", "data base"="database"
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Common technical/academic abbreviations → expand before any matching
-ABBREVIATIONS = {
-    "sql":    "structured query language",
-    "dbms":   "database management system",
-    "rdbms":  "relational database management system",
-    "nosql":  "not only sql",
-    "os":     "operating system",
-    "cpu":    "central processing unit",
-    "gpu":    "graphics processing unit",
-    "ram":    "random access memory",
-    "rom":    "read only memory",
-    "hdd":    "hard disk drive",
-    "ssd":    "solid state drive",
-    "oop":    "object oriented programming",
-    "api":    "application programming interface",
-    "url":    "uniform resource locator",
-    "http":   "hypertext transfer protocol",
-    "https":  "hypertext transfer protocol secure",
-    "html":   "hypertext markup language",
-    "css":    "cascading style sheets",
-    "xml":    "extensible markup language",
-    "json":   "javascript object notation",
-    "ai":     "artificial intelligence",
-    "ml":     "machine learning",
-    "dl":     "deep learning",
-    "nlp":    "natural language processing",
-    "nn":     "neural network",
-    "cnn":    "convolutional neural network",
-    "rnn":    "recurrent neural network",
-    "io":     "input output",
-    "ui":     "user interface",
-    "ux":     "user experience",
-    "ide":    "integrated development environment",
-    "sdk":    "software development kit",
-    "mvc":    "model view controller",
-    "tcp":    "transmission control protocol",
-    "ip":     "internet protocol",
-    "dns":    "domain name system",
-    "ftp":    "file transfer protocol",
-    "lan":    "local area network",
-    "wan":    "wide area network",
-    "dna":    "deoxyribonucleic acid",
-    "rna":    "ribonucleic acid",
-    "atp":    "adenosine triphosphate",
-    "co2":    "carbon dioxide",
-    "h2o":    "water",
-    "er":     "entity relationship",
-    "erd":    "entity relationship diagram",
-    "dfd":    "data flow diagram",
-    "uml":    "unified modeling language",
-    "crud":   "create read update delete",
-    "acid":   "atomicity consistency isolation durability",
-    "bst":    "binary search tree",
-    "dll":    "doubly linked list",
-    "lifo":   "last in first out",
-    "fifo":   "first in first out",
-    "adt":    "abstract data type",
-    "avg":    "average",
-    "max":    "maximum",
-    "min":    "minimum",
+ABBREVIATIONS: dict = {
+    # CS / programming
+    "sql":   "structured query language",
+    "dbms":  "database management system",
+    "rdbms": "relational database management system",
+    "nosql": "not only sql",
+    "os":    "operating system",
+    "cpu":   "central processing unit",
+    "gpu":   "graphics processing unit",
+    "ram":   "random access memory",
+    "rom":   "read only memory",
+    "hdd":   "hard disk drive",
+    "ssd":   "solid state drive",
+    "oop":   "object oriented programming",
+    "oops":  "object oriented programming",
+    "api":   "application programming interface",
+    "url":   "uniform resource locator",
+    "http":  "hypertext transfer protocol",
+    "https": "hypertext transfer protocol secure",
+    "html":  "hypertext markup language",
+    "css":   "cascading style sheets",
+    "xml":   "extensible markup language",
+    "json":  "javascript object notation",
+    "ai":    "artificial intelligence",
+    "ml":    "machine learning",
+    "dl":    "deep learning",
+    "nlp":   "natural language processing",
+    "nn":    "neural network",
+    "cnn":   "convolutional neural network",
+    "rnn":   "recurrent neural network",
+    "io":    "input output",
+    "ui":    "user interface",
+    "ux":    "user experience",
+    "ide":   "integrated development environment",
+    "sdk":   "software development kit",
+    "mvc":   "model view controller",
+    "tcp":   "transmission control protocol",
+    "ip":    "internet protocol",
+    "dns":   "domain name system",
+    "ftp":   "file transfer protocol",
+    "lan":   "local area network",
+    "wan":   "wide area network",
+    "er":    "entity relationship",
+    "erd":   "entity relationship diagram",
+    "dfd":   "data flow diagram",
+    "uml":   "unified modeling language",
+    "crud":  "create read update delete",
+    "acid":  "atomicity consistency isolation durability",
+    "bst":   "binary search tree",
+    "dll":   "doubly linked list",
+    "lifo":  "last in first out",
+    "fifo":  "first in first out",
+    "adt":   "abstract data type",
+    # Science
+    "dna":   "deoxyribonucleic acid",
+    "rna":   "ribonucleic acid",
+    "atp":   "adenosine triphosphate",
+    "co2":   "carbon dioxide",
+    "h2o":   "water",
+}
+
+# Known compound words: "data base" → "database" etc.
+_COMPOUND_WORDS = {
+    "database", "databases", "hardware", "software", "firmware",
+    "keyboard", "touchscreen", "smartphone", "broadband", "bluetooth",
+    "username", "password", "firewall", "malware", "ransomware",
+    "frontend", "backend", "fullstack", "codebase", "runtime",
+    "middleware", "namespace", "callback", "overload", "override",
+    "underflow", "overflow", "deadlock", "blockchain", "timestamp",
+    "checksum", "bitmap", "bytecode", "sourcecode", "microprocessor",
+    "multiprocessing", "multithreading", "hyperlink", "hypertext",
+    "localhost", "bandwidth", "throughput", "photosynthesis",
+    "carbohydrate", "mitochondria", "chromosome", "electromagnetic",
+    "thermodynamics", "semiconductors", "inheritance", "polymorphism",
+    "encapsulation", "abstraction",
 }
 
 
-def _expand_abbreviations(text: str) -> str:
-    """
-    Replace known abbreviations with full forms.
-    Works on word boundaries so 'OS' in 'BOSS' is not expanded.
-    """
-    words = text.split()
-    expanded = []
-    for word in words:
-        clean = word.lower().strip(".,;:!?()")
-        if clean in ABBREVIATIONS:
-            expanded.append(ABBREVIATIONS[clean])
-        else:
-            expanded.append(word)
-    return " ".join(expanded)
+def _expand_abbrev(text: str) -> str:
+    words, out = text.split(), []
+    for w in words:
+        clean = w.lower().strip(".,;:!?()")
+        out.append(ABBREVIATIONS[clean] if clean in ABBREVIATIONS else w)
+    return " ".join(out)
 
 
-def _collapse_compound_spaces(text: str) -> str:
-    """
-    'data base' → 'database', 'hard ware' → 'hardware'.
-    Strategy: try collapsing adjacent word pairs and check against a known
-    compound-word vocabulary. Falls back gracefully if pair isn't known.
-    """
-    COMPOUND_WORDS = {
-        "database", "databases", "hardware", "software", "firmware",
-        "keyboard", "touchscreen", "smartphone", "broadband", "bluetooth",
-        "username", "password", "firewall", "malware", "ransomware",
-        "frontend", "backend", "fullstack", "codebase", "runtime",
-        "middleware", "namespace", "callback", "overload", "override",
-        "underflow", "overflow", "deadlock", "blockchain", "timestamp",
-        "checksum", "bitmap", "bytecode", "sourcecode", "microprocessor",
-        "multiprocessing", "multithreading", "subprocess", "subprocess",
-        "hyperlink", "hypertext", "localhost", "bandwidth", "throughput",
-        "photosynthesis", "carbohydrate", "mitochondria", "chromosome",
-        "electromagnetic", "thermodynamics", "semiconductors",
-    }
-    words = text.split()
-    result = []
-    i = 0
+def _collapse_compounds(text: str) -> str:
+    words, result, i = text.split(), [], 0
     while i < len(words):
         if i + 1 < len(words):
             pair = words[i].lower() + words[i + 1].lower()
-            if pair in COMPOUND_WORDS:
-                result.append(pair)
-                i += 2
-                continue
-        result.append(words[i])
-        i += 1
+            if pair in _COMPOUND_WORDS:
+                result.append(pair); i += 2; continue
+        result.append(words[i]); i += 1
     return " ".join(result)
 
 
 def normalise(text: str) -> str:
     """
-    Full normalisation pipeline:
-      1. Lowercase + strip
-      2. Expand abbreviations (SQL → structured query language)
-      3. Collapse compound spaces (data base → database)
-      4. Remove punctuation
-      5. Collapse whitespace
-    This is the single entry point — all techniques call this first.
+    Canonical normalisation used by EVERY technique.
+    Steps: lower → expand abbreviations → collapse compounds
+           → strip punctuation → collapse whitespace
     """
     if not text:
         return ""
-    text = text.lower().strip()
-    text = _expand_abbreviations(text)
-    text = _collapse_compound_spaces(text)
-    text = re.sub(r"[^\w\s]", "", text)   # remove punctuation
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    t = text.lower().strip()
+    t = _expand_abbrev(t)
+    t = _collapse_compounds(t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
-# Stop-words used by keyword and concept matching
 STOPWORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "through", "and",
-    "or", "but", "not", "this", "that", "it", "its", "i", "we", "you",
-    "he", "she", "they", "which", "who", "what", "when", "where", "how",
-    "also", "so", "if", "then", "than", "about", "up", "out", "use",
-    "our", "their", "there", "here", "just", "very", "much", "more",
-    "some", "any", "all", "each", "both", "few", "those", "these", "such",
-    "only", "same", "too", "used", "using", "called", "known", "defined",
+    "a","an","the","is","are","was","were","be","been","being","have","has",
+    "had","do","does","did","will","would","could","should","may","might",
+    "shall","can","to","of","in","for","on","with","at","by","from","as",
+    "into","through","and","or","but","not","this","that","it","its","i",
+    "we","you","he","she","they","which","who","what","when","where","how",
+    "also","so","if","then","than","about","up","out","use","our","their",
+    "there","here","just","very","much","more","some","any","all","each",
+    "both","few","those","these","such","only","same","too","used","using",
+    "called","known","defined","basically","generally","typically","usually",
 }
 
 
-def _meaningful_tokens(text: str) -> set:
-    """
-    Extract meaningful tokens after normalisation.
-    Removes stopwords and very short words (≤2 chars).
-    """
-    norm = normalise(text)
-    return {w for w in norm.split() if w not in STOPWORDS and len(w) > 2}
+def _tokens(text: str) -> set:
+    """Meaningful tokens from normalised text (no stopwords, len > 2)."""
+    return {w for w in normalise(text).split()
+            if w not in STOPWORDS and len(w) > 2}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 2 — EXACT MATCH (fast-path)
+# [2]  EXACT MATCH  (fast-path, checked before anything else)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _exact_match(expected: str, student: str) -> float:
-    """Returns 1.0 if both answers normalise to identical strings."""
     return 1.0 if normalise(expected) == normalise(student) else 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 3 — KEYWORD OVERLAP (with length fairness)
-# FIX: old version over-rewarded short answers that happened to share 1 token.
-# New version: overlap is penalised by a length-fairness factor.
+# [3]  CONCEPT COVERAGE
+#      Domain-specific required-concept checking.
+#
+#      Key design:
+#        • Each domain has TRIGGER WORDS (detected from question text)
+#        • Each domain has REQUIRED CONCEPTS, each with a synonym list
+#        • We check the FULL NORMALISED student answer for each synonym
+#          (not split into tokens — fixes multi-word matching bug)
+#        • Returns (ratio 0–1, covered list, missing list)
+#        • ratio=0.0 and empty lists when no domain detected
+#
+#      This is wired into BOTH pipelines (with/without expected answer).
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _keyword_match(expected: str, student: str) -> float:
+# Each concept entry: first element = display name, rest = synonyms to search
+DOMAIN_CONCEPTS: dict = {
+
+    "oop_pillars": {
+        "triggers": {
+            "pillars", "principles", "oops", "oop",
+            "object oriented", "object-oriented",
+            "four pillars", "4 pillars",
+        },
+        "concepts": [
+            # [display_name, *synonyms_to_search_in_full_text]
+            ["abstraction",
+             "abstraction", "abstract", "hide implementation",
+             "hides implementation", "hiding implementation",
+             "expose essential", "essential functionality",
+             "what it does", "implementation detail"],
+            ["encapsulation",
+             "encapsulation", "encapsulate", "data hiding",
+             "wrapping", "bundling", "bundled", "wrapped",
+             "private", "protected", "access control",
+             "bind data", "binds data"],
+            ["inheritance",
+             "inheritance", "inherit", "derive", "derived",
+             "extend", "extends", "subclass", "parent class",
+             "child class", "base class", "superclass",
+             "is a relationship"],
+            ["polymorphism",
+             "polymorphism", "polymorphic", "overloading",
+             "overriding", "many forms", "method overload",
+             "method override", "compile time", "runtime polymorphism"],
+        ],
+    },
+
+    "db_normalization": {
+        "triggers": {
+            "normalization", "normalisation", "normal forms",
+            "1nf", "2nf", "3nf", "bcnf", "denormalization",
+        },
+        "concepts": [
+            ["1NF / First Normal Form",
+             "1nf", "first normal form", "atomic values",
+             "atomicity", "no repeating groups"],
+            ["2NF / Second Normal Form",
+             "2nf", "second normal form", "partial dependency",
+             "partial dependence", "full functional dependency"],
+            ["3NF / Third Normal Form",
+             "3nf", "third normal form", "transitive dependency",
+             "transitive dependence"],
+            ["BCNF",
+             "bcnf", "boyce codd", "boyce-codd normal form"],
+        ],
+    },
+
+    "osi_model": {
+        "triggers": {
+            "osi", "osi model", "seven layers", "7 layers",
+            "network layers", "osi layers",
+        },
+        "concepts": [
+            ["Physical layer",   "physical layer", "physical"],
+            ["Data Link layer",  "data link", "datalink"],
+            ["Network layer",    "network layer", "network"],
+            ["Transport layer",  "transport layer", "transport"],
+            ["Session layer",    "session layer", "session"],
+            ["Presentation layer", "presentation layer", "presentation"],
+            ["Application layer", "application layer", "application"],
+        ],
+    },
+
+    "acid_properties": {
+        "triggers": {
+            "acid", "acid properties", "transaction properties",
+            "atomicity consistency isolation durability",
+        },
+        "concepts": [
+            ["Atomicity",   "atomicity", "atomic", "all or nothing"],
+            ["Consistency", "consistency", "consistent", "valid state"],
+            ["Isolation",   "isolation", "isolate", "concurrent transactions"],
+            ["Durability",  "durability", "durable", "permanent", "persist"],
+        ],
+    },
+
+    "sdlc": {
+        "triggers": {
+            "sdlc", "software development life cycle",
+            "phases of sdlc", "software life cycle",
+        },
+        "concepts": [
+            ["Planning",        "planning", "plan"],
+            ["Analysis",        "analysis", "requirement", "requirements"],
+            ["Design",          "design", "system design"],
+            ["Implementation",  "implementation", "coding", "development"],
+            ["Testing",         "testing", "test"],
+            ["Deployment",      "deployment", "deploy", "release"],
+            ["Maintenance",     "maintenance", "maintain"],
+        ],
+    },
+
+    "sorting_algorithms": {
+        "triggers": {
+            "sorting algorithms", "sorting techniques",
+            "types of sorting", "sorting methods",
+        },
+        "concepts": [
+            ["Bubble Sort",    "bubble sort", "bubble"],
+            ["Selection Sort", "selection sort", "selection"],
+            ["Insertion Sort", "insertion sort", "insertion"],
+            ["Merge Sort",     "merge sort", "mergesort"],
+            ["Quick Sort",     "quick sort", "quicksort"],
+        ],
+    },
+
+    "data_structures": {
+        "triggers": {
+            "data structures", "types of data structure",
+            "linear data structure", "non linear",
+        },
+        "concepts": [
+            ["Array",       "array"],
+            ["Linked List", "linked list"],
+            ["Stack",       "stack"],
+            ["Queue",       "queue"],
+            ["Tree",        "tree"],
+            ["Graph",       "graph"],
+            ["Hash Table",  "hash table", "hashing", "hashtable"],
+        ],
+    },
+
+    # ── NEW: class & object definition questions ──────────────────────────
+    # Triggers: "what is class", "class and object", "define class", etc.
+    # Required concepts are the things ANY correct answer must mention.
+    # Floor: if student covers 2/3 → score ≥ 7; all 3 → score ≥ 8
+    "oop_class_object": {
+        "triggers": {
+            "what is class", "class and object", "class and object",
+            "define class", "explain class", "what is object",
+            "class object", "class in oop", "object in oop",
+            "what are class", "class are", "object are",
+        },
+        "concepts": [
+            # Concept 1: class as a blueprint/template
+            ["class as blueprint/template",
+             "blueprint", "template", "prototype", "mold",
+             "user defined type", "user-defined type",
+             "user defined datatype", "user-defined datatype",
+             "custom datatype", "custom data type",
+             "defines structure", "structure of object",
+             "defines the structure",
+            ],
+            # Concept 2: object as instance/real entity
+            ["object as instance/entity",
+             "instance", "object", "real time entity", "realtime entity",
+             "runtime entity", "real world entity", "real entity",
+             "actual entity", "concrete", "instantiation",
+             "created from class", "created from a class",
+            ],
+            # Concept 3: purpose / what they enable
+            ["purpose (reusability/data+behavior)",
+             "reusable", "reusability", "reuse",
+             "data and behavior", "data and behaviour",
+             "holds data", "holds specific data",
+             "behavior", "behaviour", "methods and attributes",
+             "attributes and methods", "encapsulates",
+             "code reuse", "create multiple",
+            ],
+        ],
+    },
+
+    # ── NEW: inheritance definition questions ─────────────────────────────
+    "oop_inheritance": {
+        "triggers": {
+            "what is inheritance", "explain inheritance",
+            "define inheritance", "inheritance in oop",
+        },
+        "concepts": [
+            ["parent/base class",
+             "parent class", "base class", "superclass", "super class"],
+            ["child/derived class",
+             "child class", "derived class", "subclass", "sub class"],
+            ["reusability via inheritance",
+             "reuse", "reusability", "inherit properties",
+             "inherits methods", "inherits attributes",
+             "inherit", "inherits"],
+        ],
+    },
+
+    # ── NEW: polymorphism definition questions ────────────────────────────
+    "oop_polymorphism": {
+        "triggers": {
+            "what is polymorphism", "explain polymorphism",
+            "define polymorphism", "types of polymorphism",
+        },
+        "concepts": [
+            ["many forms",
+             "many forms", "multiple forms", "one interface", "different forms"],
+            ["overloading",
+             "overloading", "method overloading", "compile time",
+             "compile-time", "static polymorphism"],
+            ["overriding",
+             "overriding", "method overriding", "runtime",
+             "run time", "dynamic polymorphism"],
+        ],
+    },
+
+    # ── NEW: encapsulation definition questions ───────────────────────────
+    "oop_encapsulation": {
+        "triggers": {
+            "what is encapsulation", "explain encapsulation",
+            "define encapsulation", "encapsulation in oop",
+        },
+        "concepts": [
+            ["data hiding",
+             "data hiding", "hiding", "hide data", "hides data",
+             "hide implementation", "hides implementation"],
+            ["bundling data and methods",
+             "bundling", "bundle", "wrapping", "wrap",
+             "data and methods", "methods and data",
+             "data and functions", "binds data"],
+            ["access control",
+             "private", "protected", "public",
+             "access modifier", "access specifier",
+             "getter", "setter", "getters", "setters"],
+        ],
+    },
+
+    # ── NEW: abstraction definition questions ─────────────────────────────
+    "oop_abstraction": {
+        "triggers": {
+            "what is abstraction", "explain abstraction",
+            "define abstraction", "abstraction in oop",
+        },
+        "concepts": [
+            ["hiding implementation details",
+             "hide implementation", "hides implementation",
+             "hiding details", "hide details",
+             "implementation detail", "internal detail"],
+            ["showing essential features",
+             "essential", "expose essential", "show essential",
+             "only essential", "what it does", "interface",
+             "abstract class", "abstract method"],
+            ["reducing complexity",
+             "reduce complexity", "simplify", "complexity",
+             "simple interface", "easy to use"],
+        ],
+    },
+}
+
+
+def _detect_domain(question: str) -> Optional[str]:
     """
-    Token overlap with two fairness corrections:
-      a) Length penalty — a 2-word answer covering 2/5 tokens scores lower
-         than a 10-word answer covering the same 2 tokens
-      b) Over-answer bonus — answering more than required is never penalised
+    Return the first matching domain key for this question, or None.
+
+    Checks BOTH the raw lowercased question AND the normalised version
+    (abbreviation-expanded) so that:
+      • "OOP pillars"  → normalises to "object oriented programming pillars"
+        → matches "object oriented" trigger
+      • "what is class and object" → matches "class and object" trigger
+        in oop_class_object domain
+
+    Priority: more-specific domains checked first (longer trigger phrases
+    match before single-word ones to avoid false positives).
+    """
+    q_raw  = question.lower()
+    q_norm = normalise(question)   # abbreviation-expanded + compound-collapsed
+
+    # Check both raw and normalised to maximise recall
+    for domain, cfg in DOMAIN_CONCEPTS.items():
+        triggers = cfg["triggers"]
+        if any(tw in q_raw for tw in triggers):
+            return domain
+        if any(tw in q_norm for tw in triggers):
+            return domain
+    return None
+
+
+def _concept_coverage(student: str, question: str) -> Tuple[float, List[str], List[str]]:
+    """
+    Check which required concepts the student's answer covers.
+
+    FIX A (multi-word matching):  We search for each synonym phrase in the
+    FULL normalised student text, not in a token set.  This means:
+      "real time entity" is in the text → matches synonym phrase → credit given
+      "inherit" is in text → matches synonym "inherit" → inheritance credited
+
+    Returns
+    -------
+    (coverage_ratio, covered_names, missing_names)
+    All empty / 0.0 when no domain detected.
+    """
+    domain = _detect_domain(question)
+    if not domain:
+        return 0.0, [], []
+
+    concepts   = DOMAIN_CONCEPTS[domain]["concepts"]
+    stu_norm   = normalise(student)          # full string, not token set
+    covered, missing = [], []
+
+    for concept in concepts:
+        name      = concept[0]              # display name
+        synonyms  = concept[1:]             # phrases to search for
+
+        # Search each synonym phrase in the full normalised student text
+        found = any(syn in stu_norm for syn in synonyms)
+        (covered if found else missing).append(name)
+
+    ratio = len(covered) / max(1, len(concepts))
+    return ratio, covered, missing
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# [4]  KEYWORD RECALL
+#      FIX B: no length penalty.  Only measures how many expected-answer
+#      tokens the student covered.  A short but correct answer is not
+#      penalised for brevity.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _keyword_recall(expected: str, student: str) -> float:
+    """
+    Recall = |expected_tokens ∩ student_tokens| / |expected_tokens|
+
+    No length penalty.  Coverage of the expected answer's key terms is
+    the only signal — a concise correct answer scores as high as a verbose one.
     """
     try:
-        exp_tokens = _meaningful_tokens(expected)
-        stu_tokens = _meaningful_tokens(student)
-
-        if not exp_tokens:
-            return 0.5   # no reference → neutral
-
-        overlap = len(exp_tokens & stu_tokens)
-        recall  = overlap / len(exp_tokens)    # how much of expected is covered
-
-        # Length fairness: student should write roughly as much as expected
-        exp_word_count = max(1, len(expected.split()))
-        stu_word_count = max(1, len(student.split()))
-        length_ratio   = min(1.0, stu_word_count / exp_word_count)
-
-        # Weighted: recall is primary (80%), length ratio is penalty guard (20%)
-        return round(recall * 0.80 + length_ratio * 0.20, 4)
-
+        exp_t = _tokens(expected)
+        stu_t = _tokens(student)
+        if not exp_t:
+            return 0.5
+        return round(len(exp_t & stu_t) / len(exp_t), 4)
     except Exception as e:
-        logger.warning("keyword_match failed: %s", e)
-        return 0.3   # safe fallback
+        logger.warning("keyword_recall failed: %s", e)
+        return 0.3
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 3b — TF-IDF COSINE (supporting signal, NOT dominant)
-# FIX: weight reduced. TF-IDF is good for n-gram overlap but rewards
-# surface similarity; semantic is far more reliable for subjective answers.
+# [5]  SYNONYM MATCH
+#      FIX A (multi-word synonyms):
+#        Step 1 — phrase check in full text  (catches "real time entity", etc.)
+#        Step 2 — token-level group lookup   (built-in SYNONYM_GROUPS map)
+#        Step 3 — optional WordNet expansion
+#        Step 4 — stem prefix (last resort)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Each group = set of synonymous words/phrases (single or multi-word)
+SYNONYM_GROUPS: List[set] = [
+    # OOP — class/object
+    # "user defined datatype", "codebase" added so Q1-style answers get credit
+    {"class", "blueprint", "template", "prototype", "mold", "pattern",
+     "user defined type", "user defined datatype", "user-defined datatype",
+     "custom type", "custom datatype", "structure"},
+    {"object", "instance", "entity", "real time entity", "realtime entity",
+     "runtime entity", "actual entity", "concrete object", "real world entity",
+     "real entity", "real object", "real world object"},
+    # reusable/reusability ≈ code reuse benefit (mentioned in Q1 student answer)
+    {"reusable", "reusability", "reuse", "code reuse", "modular",
+     "modularity", "maintainable", "maintainability"},
+
+    # OOP pillars
+    {"abstraction", "abstract", "hiding details", "hide implementation",
+     "expose essential", "hides implementation", "essential functionality"},
+    {"encapsulation", "encapsulate", "data hiding", "wrapping", "bundling",
+     "access control", "bind data"},
+    {"inheritance", "inherit", "derive", "extend", "subclass",
+     "parent class", "child class", "base class", "superclass"},
+    {"polymorphism", "polymorphic", "overloading", "overriding",
+     "many forms", "method overload", "method override"},
+
+    # OOP structural
+    {"method", "function", "behavior", "operation", "member function",
+     "member method"},
+    {"attribute", "field", "property", "member variable", "data member",
+     "instance variable"},
+    {"constructor", "initializer", "init method"},
+    {"access modifier", "access specifier", "visibility"},
+
+    # DB
+    {"database", "db", "datastore", "data repository"},
+    {"query", "request", "search", "retrieve", "fetch", "lookup"},
+    {"table", "relation", "record"},
+    {"primary key", "unique key", "identifier"},
+    {"normalization", "normalisation", "standardization"},
+    {"transaction", "operation", "atomic operation"},
+    {"index", "indexing", "indices"},
+
+    # Algorithms / DS
+    {"array", "list", "sequence", "collection"},
+    {"stack", "lifo", "last in first out"},
+    {"queue", "fifo", "first in first out"},
+    {"recursion", "recursive", "self-referential"},
+    {"loop", "iteration", "cycle", "repetition"},
+
+    # General academic
+    {"increase", "grow", "rise", "expand", "enhance", "improve", "escalate"},
+    {"decrease", "reduce", "fall", "decline", "diminish", "lessen"},
+    {"important", "significant", "crucial", "vital", "essential", "key", "critical"},
+    {"process", "procedure", "approach", "technique", "mechanism"},
+    {"store", "save", "retain", "persist", "hold", "keep"},
+    {"convert", "transform", "change", "alter", "modify"},
+    {"create", "generate", "produce", "make", "build", "construct"},
+    {"delete", "remove", "erase", "drop", "eliminate"},
+    {"allow", "permit", "enable", "authorize", "grant"},
+    {"prevent", "restrict", "block", "prohibit", "disallow"},
+    {"fast", "quick", "rapid", "efficient", "speedy"},
+    {"slow", "sluggish", "inefficient", "delayed"},
+    {"simple", "easy", "straightforward", "uncomplicated"},
+    {"complex", "complicated", "difficult", "hard", "challenging"},
+
+    # Science
+    {"energy", "power", "force", "strength"},
+    {"cell", "unit", "component", "element"},
+    {"photosynthesis", "light reaction", "carbon fixation"},
+    {"respiration", "breathing", "gas exchange"},
+    {"atom", "particle", "molecule"},
+]
+
+
+def _build_syn_map(groups: List[set]) -> dict:
+    """
+    Build two lookup structures:
+      token_map:  token → set of group indices  (for fast token lookup)
+      phrase_list: sorted list of (phrase, group_idx) for multi-word search
+    """
+    token_map  = {}
+    phrase_list = []
+    for idx, grp in enumerate(groups):
+        for entry in grp:
+            tokens = entry.split()
+            if len(tokens) == 1:
+                token_map.setdefault(tokens[0], set()).add(idx)
+            else:
+                phrase_list.append((entry, idx))
+    # Sort longest phrases first so longer matches take priority
+    phrase_list.sort(key=lambda x: -len(x[0]))
+    return token_map, phrase_list
+
+
+_SYN_TOKEN_MAP, _SYN_PHRASE_LIST = _build_syn_map(SYNONYM_GROUPS)
+
+
+def _synonym_match(expected: str, student: str) -> float:
+    """
+    For each meaningful token in the expected answer, award credit if:
+      1. Token appears directly in student tokens  → 1.00
+      2. Token's multi-word phrase found in student full text → 0.95
+         (FIX A: this catches "real time entity", "parent class", etc.)
+      3. Token shares a synonym group with any student token → 0.85
+      4. WordNet expansion match (if NLTK available) → 0.88
+      5. Stem prefix match (4+ char prefix) → 0.60
+    """
+    exp_tokens = _tokens(expected)
+    stu_tokens = _tokens(student)
+    stu_norm   = normalise(student)     # full text for phrase search
+
+    if not exp_tokens:
+        return 0.5
+
+    def _token_groups(tok: str) -> set:
+        return _SYN_TOKEN_MAP.get(tok, set())
+
+    def _phrase_groups_in_text(text: str) -> set:
+        """All group indices whose phrases appear in text."""
+        found = set()
+        for phrase, idx in _SYN_PHRASE_LIST:
+            if phrase in text:
+                found.add(idx)
+        return found
+
+    stu_phrase_groups = _phrase_groups_in_text(stu_norm)
+
+    # Optional WordNet
+    try:
+        import nltk
+        from nltk.corpus import wordnet
+        try:
+            nltk.data.find("corpora/wordnet")
+        except LookupError:
+            nltk.download("wordnet", quiet=True)
+            nltk.download("omw-1.4", quiet=True)
+
+        def _wn_syns(w: str) -> set:
+            s = {w}
+            for syn in wordnet.synsets(w):
+                for lem in syn.lemmas():
+                    s.add(lem.name().lower().replace("_", " "))
+            return s
+
+        wordnet_available = True
+    except Exception:
+        wordnet_available = False
+
+    matched = 0.0
+    for ew in exp_tokens:
+        # 1. Direct token match
+        if ew in stu_tokens:
+            matched += 1.0
+            continue
+
+        # 2. Multi-word phrase that contains this token appears in student text
+        ew_groups = _token_groups(ew)
+        if ew_groups & stu_phrase_groups:
+            matched += 0.95
+            continue
+
+        # 3. Synonym group via token map
+        if ew_groups and any(_token_groups(sw) & ew_groups for sw in stu_tokens):
+            matched += 0.85
+            continue
+
+        # 4. WordNet
+        if wordnet_available:
+            try:
+                ew_syns = _wn_syns(ew)
+                if ew_syns & stu_tokens:
+                    matched += 0.88
+                    continue
+            except Exception:
+                pass
+
+        # 5. Stem prefix
+        if len(ew) > 5:
+            stem = ew[:max(4, len(ew) - 3)]
+            if any(sw.startswith(stem) for sw in stu_tokens):
+                matched += 0.60
+
+    return min(1.0, round(matched / len(exp_tokens), 4))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# [6]  TF-IDF COSINE  (supporting signal only — not dominant)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _tfidf_cosine(expected: str, student: str) -> float:
-    """
-    TF-IDF cosine similarity. Normalised text fed in to benefit from
-    abbreviation expansion and compound-word collapse done upstream.
-    Uses bigrams (1,2) to catch phrase-level similarity.
-    """
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
 
-        exp_norm = normalise(expected)
-        stu_norm = normalise(student)
-
-        if not exp_norm or not stu_norm:
+        e = normalise(expected)
+        s = normalise(student)
+        if not e or not s:
             return 0.0
 
         vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1,
                               stop_words="english", sublinear_tf=True)
-        mat = vec.fit_transform([exp_norm, stu_norm])
-        score = float(cosine_similarity(mat[0], mat[1])[0][0])
-        return max(0.0, min(1.0, score))
-
-    except Exception as e:
-        logger.warning("tfidf_cosine failed: %s — using keyword fallback", e)
-        return _keyword_match(expected, student) * 0.80
+        mat = vec.fit_transform([e, s])
+        return float(max(0.0, min(1.0, cosine_similarity(mat[0], mat[1])[0][0])))
+    except Exception as ex:
+        logger.warning("tfidf_cosine failed: %s", ex)
+        return _keyword_recall(expected, student) * 0.80
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 4 — SEMANTIC SIMILARITY (dominant local signal)
-# Uses sentence-transformers MiniLM. Embeddings for expected answers are
-# PRECOMPUTED and cached by question_id to avoid re-encoding on each submission.
+# [7]  SEMANTIC SIMILARITY  (MiniLM sentence embeddings)
+#      Expected answer embedding is cached per question_id.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Singleton model — loaded once, reused across all requests
-_st_model       = None
-_st_model_lock  = threading.Lock()
+_st_model      = None
+_st_model_lock = threading.Lock()
 
 
 def _get_st_model():
-    """Thread-safe lazy loader for SentenceTransformer."""
     global _st_model
     if _st_model is None:
         with _st_model_lock:
@@ -330,7 +814,7 @@ def _get_st_model():
                 try:
                     from sentence_transformers import SentenceTransformer
                     _st_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
-                    logger.info("SentenceTransformer (MiniLM) loaded successfully.")
+                    logger.info("SentenceTransformer loaded.")
                 except Exception as e:
                     logger.warning("SentenceTransformer load failed: %s", e)
                     _st_model = "FAILED"
@@ -338,11 +822,7 @@ def _get_st_model():
 
 
 def get_expected_embedding(question_id: int, expected_text: str):
-    """
-    Returns the embedding for an expected answer.
-    CACHES by question_id — avoids re-encoding the same expected answer
-    for every student submission. This is the key performance optimization.
-    """
+    """Cache expected-answer embedding by question_id (avoids re-encoding)."""
     with _embedding_lock:
         if question_id in _embedding_cache:
             return _embedding_cache[question_id]
@@ -350,95 +830,80 @@ def get_expected_embedding(question_id: int, expected_text: str):
     model = _get_st_model()
     if model is None:
         return None
-
     try:
-        embedding = model.encode([normalise(expected_text)])[0]
-
+        emb = model.encode([normalise(expected_text)])[0]
         with _embedding_lock:
-            # LRU eviction: if cache is too large, drop oldest entry
             if len(_embedding_cache) >= EMBEDDING_CACHE_MAX:
-                oldest_key = next(iter(_embedding_cache))
-                del _embedding_cache[oldest_key]
-            _embedding_cache[question_id] = embedding
-
-        return embedding
-
+                del _embedding_cache[next(iter(_embedding_cache))]
+            _embedding_cache[question_id] = emb
+        return emb
     except Exception as e:
-        logger.warning("Embedding failed for q%s: %s", question_id, e)
+        logger.warning("Embedding error q%s: %s", question_id, e)
         return None
 
 
-def _semantic_similarity(expected: str, student: str,
-                          question_id: Optional[int] = None) -> float:
+def _semantic_sim(expected: str, student: str,
+                  question_id: Optional[int] = None) -> float:
     """
-    Semantic similarity via MiniLM cosine similarity.
-    If question_id is provided, uses cached expected embedding (faster).
-    Falls back to TF-IDF if model is unavailable.
-
-    FIX: threshold changed. Old code was thresholding at 0.5, which caused
-    correct paraphrased answers to score < 50%. Now raw cosine is returned
-    and thresholding is done only at the final scoring stage.
+    Cosine similarity between MiniLM sentence embeddings.
+    Raw cosine returned — no internal threshold applied here.
+    Thresholding happens only in _apply_thresholds().
     """
     try:
         from sklearn.metrics.pairwise import cosine_similarity as cos_sim
-        import numpy as np
 
         model = _get_st_model()
         if model is None:
             return _tfidf_cosine(expected, student)
 
-        # Use cached expected embedding if question_id is provided
-        if question_id is not None:
-            exp_emb = get_expected_embedding(question_id, expected)
-        else:
-            exp_emb = model.encode([normalise(expected)])[0]
+        exp_emb = (get_expected_embedding(question_id, expected)
+                   if question_id is not None
+                   else model.encode([normalise(expected)])[0])
 
         if exp_emb is None:
             return _tfidf_cosine(expected, student)
 
         stu_emb = model.encode([normalise(student)])[0]
-
-        score = float(cos_sim([exp_emb], [stu_emb])[0][0])
-        return max(0.0, min(1.0, score))
+        return float(max(0.0, min(1.0, cos_sim([exp_emb], [stu_emb])[0][0])))
 
     except Exception as e:
-        logger.warning("semantic_similarity failed: %s — using TF-IDF", e)
+        logger.warning("semantic_sim failed: %s", e)
         return _tfidf_cosine(expected, student)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STEP 5 — GEMINI AI (optional dominant signal)
-# Runs in a thread with strict timeout. Evaluates semantic quality,
-# key point coverage, and provides human-readable feedback.
+# [8]  GEMINI  (optional, dominant when available)
 # ═════════════════════════════════════════════════════════════════════════════
 
-GEMINI_PROMPT_WITH_EXPECTED = """\
+_GEMINI_PROMPT_WITH_EXPECTED = """\
 You are a strict but fair academic evaluator scoring a student's answer.
 
-Return ONLY valid JSON with no markdown fences:
+Return ONLY valid JSON — no markdown fences, no explanation outside JSON:
 {{
   "semantic_score": <float 0.0–1.0>,
   "feedback": "<2–3 specific sentences: what is correct, what is missing, how to improve>",
   "key_points_covered": ["<concept 1>", "<concept 2>"],
-  "key_points_missing": ["<concept A>", "<concept B>"]
+  "key_points_missing":  ["<concept A>", "<concept B>"]
 }}
 
 SCORING GUIDE:
-- 0.90–1.00: All key concepts covered (wording may differ — synonyms count)
-- 0.75–0.89: Very good, only minor details missing
-- 0.55–0.74: Good, main idea present but important details absent
-- 0.35–0.54: Partial — some relevant content but significant gaps
-- 0.15–0.34: Weak — barely touches the topic
-- 0.00–0.14: Wrong or completely irrelevant
+- 0.90–1.00 : All key concepts correct (synonyms/paraphrasing = full credit)
+- 0.75–0.89 : Very good, only minor details missing
+- 0.55–0.74 : Good, main idea present but important details absent
+- 0.35–0.54 : Partial — some relevant content but significant gaps
+- 0.15–0.34 : Weak — barely touches the topic
+- 0.00–0.14 : Wrong or completely irrelevant
 
 RULES:
-- Synonyms, paraphrasing, and abbreviation expansions = full credit for that concept
-- "SQL" and "Structured Query Language" are the same — never penalise abbreviations
-- "data base" and "database" are the same — never penalise spacing variants
+- Synonyms and paraphrasing = full credit for that concept
+- "SQL" = "Structured Query Language" — never penalise abbreviations
+- "data base" = "database" — never penalise spacing variants
+- "real time entity" ≈ "instance" — accept equivalent CS terminology
+- "class are like blueprint" = student knows class is a blueprint — give credit
 - Spelling/grammar errors do NOT reduce score unless meaning is lost
-- Feedback MUST name specific concepts, not generic phrases like "good answer"
-- Never return exactly 0.0 unless the answer is empty or gibberish
-- Never return exactly 1.0 unless the answer is flawlessly complete
+- Feedback MUST name specific concepts, NOT generic phrases like "good answer"
+- Never return exactly 0.0 unless answer is empty or gibberish
+- Never return exactly 1.0 unless answer is flawlessly complete
 
 EXPECTED ANSWER:
 \"\"\"{expected}\"\"\"
@@ -447,56 +912,49 @@ STUDENT ANSWER:
 \"\"\"{student}\"\"\"\
 """
 
-GEMINI_PROMPT_NO_EXPECTED = """\
+_GEMINI_PROMPT_NO_EXPECTED = """\
 You are a strict but fair academic evaluator.
-The teacher did NOT provide an expected answer. Evaluate the student's answer
-based solely on your subject-matter knowledge.
+The teacher did NOT provide an expected answer.
+Evaluate the student's answer based on your subject-matter knowledge.
 
 Question: \"\"\"{question}\"\"\"
 Student Answer: \"\"\"{student}\"\"\"
 
-Return ONLY valid JSON with no markdown fences:
+Return ONLY valid JSON:
 {{
   "semantic_score": <float 0.0–1.0>,
-  "feedback": "<2–3 specific sentences about correctness, completeness, and how to improve>",
+  "feedback": "<2–3 sentences: what is correct, missing, how to improve>",
   "key_points_covered": ["<concept correctly mentioned>"],
-  "key_points_missing": ["<important concept not mentioned>"]
+  "key_points_missing":  ["<important concept not mentioned>"]
 }}
 
 RULES:
-- Evaluate on factual correctness and completeness only
-- Synonyms and paraphrasing count as full credit
-- Never return exactly 0.0 unless the answer is empty or gibberish\
+- Evaluate on factual correctness and completeness
+- Synonyms and paraphrasing = full credit
+- Never return exactly 0.0 unless answer is empty or gibberish\
 """
 
 
 def _gemini_evaluate(expected: str, student: str,
                      question: str = "") -> Optional[dict]:
-    """
-    Call Gemini with a daemon thread + strict timeout.
-    Returns None if API key is missing, request times out, or JSON is invalid.
-    The calling code MUST handle None (falls back to local pipeline).
-    """
+    """Call Gemini with strict thread timeout. Returns None on any failure."""
     if not GEMINI_API_KEY:
         return None
 
-    result_holder = [None]
-    error_holder  = [None]
+    result_holder: list = [None]
+    error_holder:  list = [None]
 
     def _call():
         try:
             import google.generativeai as genai
             genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-
+            model  = genai.GenerativeModel(GEMINI_MODEL)
             prompt = (
-                GEMINI_PROMPT_WITH_EXPECTED.format(expected=expected, student=student)
+                _GEMINI_PROMPT_WITH_EXPECTED.format(expected=expected, student=student)
                 if expected.strip()
-                else GEMINI_PROMPT_NO_EXPECTED.format(
-                    question=question or "Unknown question", student=student
-                )
+                else _GEMINI_PROMPT_NO_EXPECTED.format(
+                    question=question or "Unknown question", student=student)
             )
-
             for attempt in range(MAX_RETRIES + 1):
                 try:
                     resp = model.generate_content(
@@ -507,34 +965,29 @@ def _gemini_evaluate(expected: str, student: str,
                             "response_mime_type": "application/json",
                         },
                     )
-                    text = resp.text.strip()
-                    # Strip markdown fences if model ignores mime type
-                    text = re.sub(r"^```json\s*", "", text)
+                    text = re.sub(r"^```json\s*", "", resp.text.strip())
                     text = re.sub(r"```$", "", text).strip()
+                    data = json.loads(text)
 
-                    data  = json.loads(text)
-                    score = float(data.get("semantic_score", 0.5))
-                    score = max(0.01, min(0.99, score))
-
-                    covered = data.get("key_points_covered", [])
-                    missing = data.get("key_points_missing", [])
-                    covered = [str(x).strip() for x in covered if str(x).strip()]
-                    missing = [str(x).strip() for x in missing if str(x).strip()]
+                    score   = float(max(0.01, min(0.99,
+                                   float(data.get("semantic_score", 0.5)))))
+                    covered = [str(x).strip() for x in
+                               data.get("key_points_covered", []) if str(x).strip()]
+                    missing = [str(x).strip() for x in
+                               data.get("key_points_missing", []) if str(x).strip()]
 
                     result_holder[0] = {
-                        "score":              score,
-                        "feedback":           str(data.get("feedback", "")).strip(),
-                        "key_points_covered": covered,
-                        "key_points_missing": missing,
+                        "score":    score,
+                        "feedback": str(data.get("feedback", "")).strip(),
+                        "covered":  covered,
+                        "missing":  missing,
                     }
                     return
-
                 except (json.JSONDecodeError, Exception):
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_DELAY)
                     else:
-                        error_holder[0] = "Max retries exceeded"
-
+                        error_holder[0] = "retries exhausted"
         except Exception as e:
             error_holder[0] = e
 
@@ -543,367 +996,192 @@ def _gemini_evaluate(expected: str, student: str,
     t.join(timeout=GEMINI_TIMEOUT)
 
     if t.is_alive():
-        logger.warning("Gemini timed out after %ss — falling back to local.", GEMINI_TIMEOUT)
+        logger.warning("Gemini timed out — using local fallback.")
         return None
     if error_holder[0]:
-        logger.warning("Gemini error: %s — falling back to local.", error_holder[0])
+        logger.warning("Gemini error: %s — using local fallback.", error_holder[0])
         return None
     return result_holder[0]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SYNONYM MATCHING — domain-aware vocabulary map
-# ═════════════════════════════════════════════════════════════════════════════
-
-SYNONYM_GROUPS = [
-    # Computer Science / DB
-    {"database", "db", "datastore", "repository", "data store"},
-    {"query", "request", "search", "retrieve", "fetch", "lookup"},
-    {"table", "relation", "entity", "record"},
-    {"primary key", "unique key", "identifier", "id"},
-    {"index", "indexing", "indices"},
-    {"transaction", "operation", "commit"},
-    {"join", "merge", "combine", "link"},
-    {"schema", "structure", "layout", "design"},
-    {"normalization", "normalisation", "standardization"},
-    {"concurrency", "parallel", "simultaneous"},
-    # Programming
-    {"function", "method", "procedure", "routine", "subroutine"},
-    {"class", "blueprint", "template", "prototype"},
-    {"object", "instance", "entity"},
-    {"variable", "identifier", "name", "symbol"},
-    {"loop", "iteration", "cycle", "repetition"},
-    {"condition", "conditional", "branch", "decision"},
-    {"array", "list", "collection", "sequence"},
-    {"pointer", "reference", "address"},
-    {"recursion", "recursive", "self-referential"},
-    {"inheritance", "derive", "extend", "subclass"},
-    {"encapsulation", "wrapping", "hiding", "bundling"},
-    {"polymorphism", "overloading", "overriding"},
-    {"abstraction", "interface", "contract"},
-    # General academic
-    {"increase", "grow", "rise", "expand", "enhance", "improve", "escalate"},
-    {"decrease", "reduce", "fall", "decline", "diminish", "lessen"},
-    {"important", "significant", "crucial", "vital", "essential", "key", "critical"},
-    {"process", "procedure", "method", "approach", "technique", "mechanism"},
-    {"store", "save", "retain", "persist", "hold", "keep"},
-    {"transfer", "transmit", "send", "move", "relay"},
-    {"convert", "transform", "change", "alter", "modify"},
-    {"compare", "contrast", "differentiate", "distinguish"},
-    {"define", "describe", "explain", "state", "specify"},
-    {"use", "utilize", "employ", "apply", "leverage"},
-    {"create", "generate", "produce", "make", "build", "construct"},
-    {"delete", "remove", "erase", "drop", "eliminate"},
-    {"access", "retrieve", "fetch", "get", "read"},
-    {"update", "modify", "edit", "change", "alter"},
-    {"manage", "control", "handle", "govern", "administer"},
-    {"protect", "secure", "guard", "defend", "shield"},
-    {"allow", "permit", "enable", "authorize", "grant"},
-    {"prevent", "restrict", "block", "prohibit", "disallow"},
-    {"fast", "quick", "rapid", "efficient", "speedy"},
-    {"slow", "sluggish", "inefficient", "delayed"},
-    {"simple", "easy", "straightforward", "uncomplicated"},
-    {"complex", "complicated", "difficult", "hard", "challenging"},
-    {"small", "little", "tiny", "minimal", "compact"},
-    {"large", "big", "huge", "massive", "extensive", "vast"},
-    # Science
-    {"energy", "power", "force", "strength"},
-    {"cell", "unit", "component", "element"},
-    {"organism", "living thing", "creature", "being"},
-    {"photosynthesis", "light reaction", "carbon fixation"},
-    {"respiration", "breathing", "gas exchange"},
-    {"atom", "particle", "molecule"},
-    {"reaction", "process", "interaction"},
-]
-
-
-def _build_synonym_map() -> dict:
-    """Map each word to a group index for O(1) synonym lookup."""
-    m = {}
-    for i, grp in enumerate(SYNONYM_GROUPS):
-        for w in grp:
-            for token in w.split():   # multi-word phrases: map each token
-                if token not in m:
-                    m[token] = set()
-                m[token].add(i)
-    return m
-
-
-_SYNONYM_MAP = _build_synonym_map()
-
-
-def _synonym_match(expected: str, student: str) -> float:
-    """
-    Matches tokens that are synonyms (same group index).
-    Falls back to NLTK WordNet if available, otherwise uses built-in map.
-    """
-    exp_tokens = _meaningful_tokens(expected)
-    stu_tokens = _meaningful_tokens(student)
-    if not exp_tokens:
-        return 0.5
-
-    def _groups(word: str) -> set:
-        """Return all synonym group indices a word belongs to."""
-        return _SYNONYM_MAP.get(word, set())
-
-    try:
-        import nltk
-        from nltk.corpus import wordnet
-        try:
-            nltk.data.find("corpora/wordnet")
-        except LookupError:
-            nltk.download("wordnet", quiet=True)
-            nltk.download("omw-1.4", quiet=True)
-
-        def _wn_synonyms(word: str) -> set:
-            syns = {word}
-            for syn in wordnet.synsets(word):
-                for lemma in syn.lemmas():
-                    syns.add(lemma.name().lower().replace("_", " "))
-            return syns
-
-        matched = 0.0
-        for ew in exp_tokens:
-            if ew in stu_tokens:
-                matched += 1.0
-                continue
-            # WordNet synonym check
-            ew_syns = _wn_synonyms(ew)
-            if ew_syns & stu_tokens:
-                matched += 0.92
-                continue
-            # Built-in group check
-            ew_groups = _groups(ew)
-            if ew_groups and any(_groups(sw) & ew_groups for sw in stu_tokens):
-                matched += 0.85
-                continue
-            # Stem prefix check (last resort)
-            if len(ew) > 5:
-                stem = ew[:max(4, len(ew) - 3)]
-                if any(sw.startswith(stem) for sw in stu_tokens):
-                    matched += 0.65
-
-        return min(1.0, matched / len(exp_tokens))
-
-    except Exception:
-        # Pure built-in map fallback (no NLTK)
-        matched = 0.0
-        for ew in exp_tokens:
-            if ew in stu_tokens:
-                matched += 1.0
-                continue
-            ew_groups = _groups(ew)
-            if ew_groups and any(_groups(sw) & ew_groups for sw in stu_tokens):
-                matched += 0.85
-                continue
-            if len(ew) > 5:
-                stem = ew[:max(4, len(ew) - 3)]
-                if any(sw.startswith(stem) for sw in stu_tokens):
-                    matched += 0.65
-        return min(1.0, matched / len(exp_tokens))
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SCORING WEIGHTS
-# Design principle:
-#   - Semantic (MiniLM) is the most reliable local signal → highest weight
-#   - Keyword + synonym support semantic, catch what embeddings miss
-#   - TF-IDF is a weak supporting signal only — was over-weighted before
-#   - Gemini dominates all when available (it reasons about meaning)
+# [9]  WEIGHTED FUSION + SCORE CONVERSION
 #
-# Weights MUST sum to 1.0 within each set.
+#  content_signal  =  composite of all signals, used to drive final score
+#
+#  With Gemini:    gemini leads (0.40), semantic supports (0.20),
+#                  concept_coverage floor applied on top
+#  Without Gemini: semantic leads (0.38), synonym (0.22), concept (0.20),
+#                  keyword (0.12), tfidf (0.08)
+#
+#  concept_coverage acts as a FLOOR:
+#    if student covered 4/4 OOP pillars → content_signal ≥ 0.80 guaranteed
+#    This fixes the "knows all 4 pillars → 6/10" bug.
 # ═════════════════════════════════════════════════════════════════════════════
 
-WEIGHTS_WITH_GEMINI = {
-    "exact_match":   0.02,   # fast-path already handled before this point
-    "keyword_match": 0.08,
-    "tfidf_cosine":  0.08,   # FIX: reduced from 0.18 — was over-weighted
-    "semantic_sim":  0.18,   # MiniLM supports Gemini
-    "gemini":        0.42,   # dominant — reasons about meaning not surface
-    "synonym_match": 0.12,
-    "concept_match": 0.10,
+# Weights must sum to 1.0
+_W_GEMINI = {
+    "gemini":          0.40,
+    "semantic_sim":    0.20,
+    "synonym_match":   0.15,
+    "concept_coverage":0.12,
+    "keyword_recall":  0.08,
+    "tfidf_cosine":    0.05,
 }
 
-WEIGHTS_LOCAL_ONLY = {
-    "exact_match":   0.04,
-    "keyword_match": 0.15,
-    "tfidf_cosine":  0.10,   # FIX: reduced from 0.18
-    "semantic_sim":  0.42,   # FIX: dominant when Gemini unavailable
-    "synonym_match": 0.16,
-    "concept_match": 0.13,
+_W_LOCAL = {
+    "semantic_sim":    0.38,
+    "synonym_match":   0.22,
+    "concept_coverage":0.20,
+    "keyword_recall":  0.12,
+    "tfidf_cosine":    0.08,
 }
 
-assert abs(sum(WEIGHTS_WITH_GEMINI.values()) - 1.0) < 1e-9, "Gemini weights must sum to 1.0"
-assert abs(sum(WEIGHTS_LOCAL_ONLY.values())  - 1.0) < 1e-9, "Local weights must sum to 1.0"
+assert abs(sum(_W_GEMINI.values()) - 1.0) < 1e-9
+assert abs(sum(_W_LOCAL.values())  - 1.0) < 1e-9
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CONCEPT MATCH (stem-based, synonym-aware)
-# Separate from keyword_match: tries harder via stems + synonym groups
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _concept_match(expected: str, student: str) -> float:
+def _to_score(content_signal: float) -> int:
     """
-    Like keyword match but more aggressive:
-    exact → synonym group → 5-char stem prefix
+    Map content_signal (0–1) to integer grade (0–10).
+    Calibrated so:
+      ≥0.90 → 10,  ≥0.80 → 9,  ≥0.70 → 8,
+      ≥0.60 → 7,   ≥0.50 → 6,  ≥0.40 → 5,
+      ≥0.30 → 4,   ≥0.20 → 3,  ≥0.10 → 2,
+      ≥0.04 → 1,   else  → 0
     """
-    try:
-        exp_tokens = _meaningful_tokens(expected)
-        stu_tokens = _meaningful_tokens(student)
-        if not exp_tokens:
-            return 0.5
-
-        matched = 0.0
-        for ew in exp_tokens:
-            if ew in stu_tokens:
-                matched += 1.0
-                continue
-            ew_groups = _SYNONYM_MAP.get(ew, set())
-            if ew_groups and any(_SYNONYM_MAP.get(sw, set()) & ew_groups
-                                 for sw in stu_tokens):
-                matched += 0.85
-                continue
-            if len(ew) > 5:
-                stem = ew[:max(4, len(ew) - 3)]
-                if any(sw.startswith(stem) for sw in stu_tokens):
-                    matched += 0.65
-
-        return min(1.0, matched / len(exp_tokens))
-
-    except Exception as e:
-        logger.warning("concept_match failed: %s", e)
-        return 0.3
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SCORE FUSION + THRESHOLD LOGIC
-# FIX: tiered floors recalibrated using content_signal composite.
-# content_signal blends semantic, keyword, and synonym so neither alone
-# can unfairly push the score up or down.
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _compute_content_signal(scores: dict, used_gemini: bool) -> float:
-    """
-    Composite content quality signal used for floor/threshold decisions.
-    Blended to prevent any single metric from dominating.
-    """
-    gem = scores.get("gemini", 0.5) if used_gemini else 0.0
-    sem = scores.get("semantic_sim", 0.0)
-    kw  = scores.get("keyword_match", 0.0)
-    syn = scores.get("synonym_match", 0.0)
-    con = scores.get("concept_match", 0.0)
-
-    if used_gemini:
-        # Gemini leads
-        return gem * 0.50 + sem * 0.25 + kw * 0.10 + syn * 0.08 + con * 0.07
-    else:
-        # Semantic leads locally
-        return sem * 0.50 + kw * 0.20 + syn * 0.15 + con * 0.15
-
-
-def _apply_thresholds(raw_score: float, content_signal: float) -> int:
-    """
-    Convert normalised score (0–1) to integer grade (0–10).
-    Thresholds designed so:
-      - Correct paraphrased answers reach 8–10
-      - Partial answers get 4–7
-      - Off-topic / empty get 0–3
-
-    FIX: Old thresholds were too conservative, causing correct answers
-    to be capped at 7. Recalibrated for fairness.
-    """
-    # Perfect or near-perfect
-    if content_signal >= 0.93 and raw_score >= 0.95:
-        return 10
-    if content_signal >= 0.88:
-        return 9
-    if content_signal >= 0.80:
-        return 8
-    if content_signal >= 0.70:
-        return 7
-    if content_signal >= 0.58:
-        return 6
-    if content_signal >= 0.45:
-        return 5
-    if content_signal >= 0.33:
-        return 4
-    if content_signal >= 0.20:
-        return 3
-    if content_signal >= 0.10:
-        return 2
-    if content_signal >= 0.04:
-        return 1
+    thresholds = [(0.90, 10), (0.80, 9), (0.70, 8), (0.60, 7),
+                  (0.50, 6),  (0.40, 5), (0.30, 4), (0.20, 3),
+                  (0.10, 2),  (0.04, 1)]
+    for thr, grade in thresholds:
+        if content_signal >= thr:
+            return grade
     return 0
 
 
-def _build_local_feedback(score: int, scores: dict, covered: list,
-                           missing: list, no_expected: bool) -> str:
-    """Generate meaningful, metric-aware feedback without Gemini."""
-    sem = scores.get("semantic_sim", 0)
-    kw  = scores.get("keyword_match", 0)
-    con = scores.get("concept_match", 0)
+def _feedback(score: int, scores: dict, covered: list,
+              missing: list, no_expected: bool) -> str:
+    """Build meaningful, metric-specific feedback when Gemini is absent."""
+    sem  = scores.get("semantic_sim",    0)
+    kw   = scores.get("keyword_recall",  0)
+    cov  = scores.get("concept_coverage",0)
+    syn  = scores.get("synonym_match",   0)
 
-    covered_str = ", ".join(covered[:3]) if covered else None
-    missing_str = ", ".join(missing[:3]) if missing else None
+    cov_str = ", ".join(covered[:4]) if covered else None
+    mis_str = ", ".join(missing[:4]) if missing else None
 
     if score == 10:
-        return ("Perfect — your answer covers all key concepts with accuracy. "
+        return ("Perfect — all key concepts covered with accuracy. "
                 "The meaning aligns completely with the expected answer.")
     if score >= 8:
-        msg = (f"Strong answer (semantic similarity: {int(sem * 100)}%, "
-               f"keyword coverage: {int(kw * 100)}%). ")
-        msg += (f"Minor gaps: {missing_str}." if missing_str
-                else "Only minor elaboration could improve this further.")
-        return msg
+        msg = (f"Strong answer — semantic similarity {int(sem*100)}%, "
+               f"concept coverage {int(cov*100)}%. ")
+        return msg + (f"Minor gaps: {mis_str}." if mis_str
+                      else "Only minor elaboration could improve this.")
     if score >= 6:
-        msg = f"Good — main idea is present (semantic: {int(sem * 100)}%). "
-        if missing_str:
-            msg += f"Key missing concepts: {missing_str}. "
-        if covered_str:
-            msg += f"Correctly addressed: {covered_str}."
+        msg = f"Good — main idea present (semantic: {int(sem*100)}%). "
+        if cov_str:
+            msg += f"Correctly addressed: {cov_str}. "
+        if mis_str:
+            msg += f"Key concepts missing: {mis_str}."
         return msg
     if score >= 4:
-        msg = f"Partial answer (concept match: {int(con * 100)}%). "
-        if covered_str:
-            msg += f"You correctly mentioned: {covered_str}. "
-        if missing_str:
-            msg += f"Important missing concepts: {missing_str}."
-        else:
-            msg += "Significant portions of the expected answer are absent."
+        msg = f"Partial (concept coverage: {int(cov*100)}%, synonym match: {int(syn*100)}%). "
+        if cov_str:
+            msg += f"You covered: {cov_str}. "
+        if mis_str:
+            msg += f"Missing: {mis_str}."
         return msg
     if score >= 2:
-        msg = f"Weak — limited relevant content (keyword match: {int(kw * 100)}%). "
-        if missing_str:
-            msg += f"Missing core concepts: {missing_str}. "
-        msg += "Review the material and include specific terminology."
-        return msg
+        return (f"Weak — limited relevant content "
+                f"(keyword recall: {int(kw*100)}%). "
+                + (f"Missing concepts: {mis_str}. " if mis_str else "")
+                + "Include specific terminology from the topic.")
     if score == 1:
         return ("The answer barely touches the topic. "
-                "Most key concepts from the expected answer are absent. "
-                "Please review the material thoroughly.")
-    return ("No answer submitted, or the response does not address the question." if not no_expected
-            else "No answer was submitted, or the response was entirely off-topic.")
+                "Review the material and include key definitions.")
+    return ("No answer submitted." if not no_expected
+            else "No answer submitted, or entirely off-topic.")
 
 
-def _build_result(raw: float, scores: dict, feedback: str,
-                  covered: list, missing: list, used_gemini: bool,
-                  no_expected: bool = False) -> dict:
-    """Apply threshold logic and build the final result dictionary."""
-    content_signal = _compute_content_signal(scores, used_gemini)
-    final_score    = _apply_thresholds(raw, content_signal)
+# ═════════════════════════════════════════════════════════════════════════════
+# CORE PIPELINES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _pipeline_with_expected(expected: str, student: str,
+                             question: str = "",
+                             question_id: Optional[int] = None) -> dict:
+    """
+    Full pipeline when an expected answer exists.
+
+    FIX C: concept_coverage_score is now called HERE (was missing before)
+    and its result is included in the weighted fusion AND used as a floor
+    on content_signal.  This ensures Q1-style questions benefit from domain
+    concept detection even when an expected answer is present.
+    """
+    # ── Collect all local signals ─────────────────────────────────────────
+    coverage_ratio, covered, missing = _concept_coverage(student, question)
+
+    scores = {
+        "keyword_recall":   _keyword_recall(expected, student),
+        "synonym_match":    _synonym_match(expected, student),
+        "tfidf_cosine":     _tfidf_cosine(expected, student),
+        "semantic_sim":     _semantic_sim(expected, student, question_id),
+        "concept_coverage": coverage_ratio,
+    }
+
+    feedback    = ""
+    used_gemini = False
+
+    # ── Try Gemini ────────────────────────────────────────────────────────
+    gem = _gemini_evaluate(expected, student, question)
+    if gem:
+        scores["gemini"] = gem["score"]
+        feedback  = gem.get("feedback", "")
+        # Merge Gemini's covered/missing with local concept detection
+        if gem.get("covered"):
+            covered = gem["covered"]
+        if gem.get("missing"):
+            missing = gem["missing"]
+        used_gemini = True
+        weights = _W_GEMINI
+    else:
+        weights = _W_LOCAL
+
+    # ── Weighted fusion ───────────────────────────────────────────────────
+    raw_signal = sum(scores.get(k, 0) * w for k, w in weights.items())
+
+    # ── concept_coverage FLOOR ───────────────────────────────────────────────
+    # Guarantees minimum signal when student covers required concepts.
+    # Scaled by how many concepts the domain requires:
+    #   coverage_ratio=1.0  → floor=0.80 → score ≥ 9   (all concepts present)
+    #   coverage_ratio=0.67 → floor=0.54 → score ≥ 6   (2/3 concepts)
+    #   coverage_ratio=0.50 → floor=0.40 → score ≥ 5   (half concepts)
+    #   coverage_ratio=0.0  → floor=0.0  → no boost     (no domain detected)
+    # Cap at 0.82 so concept coverage alone cannot give 10 — explanation quality
+    # (semantic/synonym) must contribute the final push to 10.
+    # Floor logic:
+    #   3/3 concepts covered → floor = 0.72 → score ≥ 8
+    #   2/3 concepts covered → floor = 0.48 → score ≥ 5
+    #   1/3 concepts covered → floor = 0.24 → score ≥ 3
+    # Score 9-10 requires BOTH concept floor AND high semantic/synonym quality.
+    # Cap at 0.75 so explanation depth (semantic, synonym) must contribute the
+    # final push — prevents shallow but keyword-complete answers from hitting 9.
+    concept_floor  = min(0.75, coverage_ratio * 0.72)
+    content_signal = max(raw_signal, concept_floor)
+
+    final_score = _to_score(content_signal)
 
     if not feedback:
-        feedback = _build_local_feedback(
-            final_score, scores, covered, missing, no_expected
-        )
+        feedback = _feedback(final_score, scores, covered, missing, no_expected=False)
 
     logger.info(
-        "Eval → sem:%.2f kw:%.2f tfidf:%.2f gem:%.2f syn:%.2f con:%.2f "
-        "| signal:%.3f raw:%.3f → %d (gemini=%s no_exp=%s)",
-        scores.get("semantic_sim", 0), scores.get("keyword_match", 0),
-        scores.get("tfidf_cosine", 0), scores.get("gemini", 0),
-        scores.get("synonym_match", 0), scores.get("concept_match", 0),
-        content_signal, raw, final_score, used_gemini, no_expected,
+        "with_exp → sem:%.2f kw:%.2f syn:%.2f cov:%.2f tfidf:%.2f gem:%.2f"
+        " | raw:%.3f floor:%.3f sig:%.3f → %d",
+        scores["semantic_sim"], scores["keyword_recall"],
+        scores["synonym_match"], scores["concept_coverage"],
+        scores["tfidf_cosine"], scores.get("gemini", 0),
+        raw_signal, concept_floor, content_signal, final_score,
     )
 
     return {
@@ -913,76 +1191,35 @@ def _build_result(raw: float, scores: dict, feedback: str,
         "key_points_missing": missing,
         "breakdown":          {k: round(v * 10, 2) for k, v in scores.items()},
         "used_gemini":        used_gemini,
-        "no_expected_answer": no_expected,
+        "no_expected_answer": False,
     }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CORE PIPELINES
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _evaluate_with_expected(expected: str, student: str,
-                             question_id: Optional[int] = None) -> dict:
+def _pipeline_without_expected(student: str, question: str = "") -> dict:
     """
-    Full hybrid pipeline when an expected answer exists.
-    All local techniques run first (fast), then Gemini (async, with timeout).
+    Pipeline when no expected answer is stored.
+
+    Primary:  Gemini (evaluates on its own subject knowledge)
+    Fallback: concept_coverage + vocabulary richness
+              FIX B: NO length bias — coverage of required concepts drives score
     """
-    # Run all local techniques — each wrapped separately so one failure
-    # doesn't cascade and kill the entire score
-    scores = {
-        "exact_match":   _exact_match(expected, student),
-        "keyword_match": _keyword_match(expected, student),
-        "tfidf_cosine":  _tfidf_cosine(expected, student),
-        "semantic_sim":  _semantic_similarity(expected, student, question_id),
-        "gemini":        0.5,   # placeholder; overwritten below if Gemini succeeds
-        "synonym_match": _synonym_match(expected, student),
-        "concept_match": _concept_match(expected, student),
-    }
-
-    feedback    = ""
-    covered     = []
-    missing     = []
-    used_gemini = False
-
-    gemini_result = _gemini_evaluate(expected, student)
-    if gemini_result:
-        scores["gemini"] = gemini_result["score"]
-        feedback    = gemini_result.get("feedback", "")
-        covered     = gemini_result.get("key_points_covered", [])
-        missing     = gemini_result.get("key_points_missing", [])
-        used_gemini = True
-        weights     = WEIGHTS_WITH_GEMINI
-    else:
-        # Gemini failed — redistribute weight across local techniques
-        weights = WEIGHTS_LOCAL_ONLY
-
-    raw = sum(scores.get(k, 0) * w for k, w in weights.items())
-    return _build_result(raw, scores, feedback, covered, missing, used_gemini, no_expected=False)
-
-
-def _evaluate_without_expected(student: str, question: str = "") -> dict:
-    """
-    Evaluation when NO expected answer is stored.
-    Gemini evaluates on its own subject knowledge.
-    Local heuristic (length + vocabulary richness) is the fallback.
-    """
-    gemini_result = _gemini_evaluate(expected="", student=student, question=question)
-
-    if gemini_result:
-        gem_score = gemini_result["score"]
-        feedback  = gemini_result.get("feedback", "")
-        covered   = gemini_result.get("key_points_covered", [])
-        missing   = gemini_result.get("key_points_missing", [])
+    # ── Try Gemini first ──────────────────────────────────────────────────
+    gem = _gemini_evaluate(expected="", student=student, question=question)
+    if gem:
+        gem_score = gem["score"]
+        covered   = gem.get("covered", [])
+        missing   = gem.get("missing", [])
+        feedback  = gem.get("feedback", "")
 
         final_score = max(1, min(9, round(gem_score * 10)))
         if gem_score < 0.05:
             final_score = 0
 
         if not feedback:
-            feedback = _build_local_feedback(
+            feedback = _feedback(
                 final_score,
-                {"semantic_sim": gem_score, "keyword_match": gem_score,
-                 "concept_match": gem_score, "synonym_match": gem_score},
+                {"semantic_sim": gem_score, "concept_coverage": gem_score,
+                 "keyword_recall": gem_score, "synonym_match": gem_score},
                 covered, missing, no_expected=True,
             )
 
@@ -996,64 +1233,91 @@ def _evaluate_without_expected(student: str, question: str = "") -> dict:
             "no_expected_answer": True,
         }
 
-    # No Gemini — heuristic based on length and vocabulary richness
-    words        = student.split()
-    word_count   = len(words)
-    unique_ratio = len({w.lower() for w in words}) / max(1, word_count)
-    meaningful   = len(_meaningful_tokens(student))
+    # ── Local fallback — concept coverage + richness ───────────────────────
+    words      = student.split()
+    word_count = len(words)
 
     if word_count == 0:
-        heuristic = 0.0
-    elif word_count < 5:
-        heuristic = 0.10
-    elif word_count < 15:
-        heuristic = 0.25 + unique_ratio * 0.15
-    elif word_count < 40:
-        heuristic = 0.35 + unique_ratio * 0.20 + min(0.10, meaningful / 50)
-    else:
-        heuristic = 0.45 + unique_ratio * 0.20 + min(0.10, meaningful / 60)
+        return {
+            "score": 0, "feedback": "No answer was submitted.",
+            "key_points_covered": [], "key_points_missing": [],
+            "breakdown": {}, "used_gemini": False, "no_expected_answer": True,
+        }
 
-    heuristic   = min(0.65, heuristic)   # cap at 6.5 — we can't verify correctness
-    final_score = max(1, min(6, round(heuristic * 10))) if word_count > 0 else 0
+    # Concept coverage (FIX B: replaces length heuristic)
+    coverage_ratio, covered, missing = _concept_coverage(student, question)
+    domain_detected = coverage_ratio > 0.0
+
+    # Vocabulary richness — meaningful terms per answer
+    meaningful   = len(_tokens(student))
+    unique_ratio = len({w.lower() for w in words}) / max(1, word_count)
+    richness     = unique_ratio * min(1.0, meaningful / 20)  # saturates at 20 terms
+
+    if domain_detected:
+        # Coverage is the main signal — length is irrelevant
+        # 4/4 pillars covered → content_quality ≈ 0.82 → score 9
+        content_quality = coverage_ratio * 0.80 + richness * 0.20
+        final_score     = _to_score(content_quality)
+        final_score     = max(1, min(10, final_score))
+    else:
+        # No domain — richness only, cap at 7 (can't verify correctness)
+        content_quality = richness * 0.65 + min(0.25, word_count / 100) * 0.35
+        final_score     = _to_score(min(0.72, content_quality))
+        final_score     = max(1, min(7, final_score))
+
+    # Feedback
+    if domain_detected:
+        if missing:
+            cov_str = ", ".join(covered)
+            mis_str = ", ".join(missing)
+            feedback = (f"Good coverage — you addressed: {cov_str}. "
+                        f"Missing: {mis_str}. Adding these would improve your score.")
+        else:
+            feedback = (f"Excellent — all required concepts covered: {', '.join(covered)}. "
+                        f"Your answer is comprehensive.")
+    else:
+        feedback = (
+            f"No expected answer on file. Evaluated on content richness "
+            f"({meaningful} meaningful terms, {int(unique_ratio*100)}% unique vocabulary). "
+            f"Ask your teacher to add an expected answer for a more accurate score."
+        )
+
+    logger.info(
+        "no_exp → domain=%s coverage=%.2f richness=%.2f quality=%.2f → %d",
+        domain_detected, coverage_ratio, richness, content_quality, final_score,
+    )
 
     return {
         "score":              final_score,
-        "feedback":           (
-            f"No expected answer is on file. Your answer was evaluated on "
-            f"length ({word_count} words) and vocabulary richness "
-            f"({int(unique_ratio * 100)}% unique words). "
-            f"Ask your teacher to add an expected answer for a more accurate score."
-        ),
-        "key_points_covered": [],
-        "key_points_missing": [],
-        "breakdown":          {"heuristic": round(heuristic * 10, 2)},
+        "feedback":           feedback,
+        "key_points_covered": covered,
+        "key_points_missing": missing,
+        "breakdown":          {
+            "concept_coverage": round(coverage_ratio * 10, 2),
+            "richness":         round(richness * 10, 2),
+            "content_quality":  round(content_quality * 10, 2),
+        },
         "used_gemini":        False,
         "no_expected_answer": True,
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AUTO-GENERATE EXPECTED ANSWER
+# AUTO-GENERATE EXPECTED ANSWER  (called by teacher interface)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def generate_expected_answer(question_text: str) -> str:
-    """
-    Use Gemini to generate a reference answer for a question.
-    Called by the teacher interface when no expected answer is provided.
-    Returns empty string on any failure.
-    """
     if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — cannot auto-generate answer.")
         return ""
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = (
+        model    = genai.GenerativeModel(GEMINI_MODEL)
+        prompt   = (
             "You are an academic subject matter expert. "
             "Provide a comprehensive, accurate expected answer for this question. "
             "Cover all key concepts in 2–4 clear sentences. "
-            "Do NOT include preamble, just the answer itself.\n\n"
+            "Do NOT include preamble — just the answer itself.\n\n"
             f"Question: {question_text}"
         )
         response = model.generate_content(
@@ -1067,44 +1331,32 @@ def generate_expected_answer(question_text: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PUBLIC API — call these from admin.py, never internals directly
+# PUBLIC API  —  call ai_evaluate_safe() from admin.py routes
 # ═════════════════════════════════════════════════════════════════════════════
 
 def ai_evaluate(expected_answer: str, student_answer: str,
                 question_text: str = "",
                 question_id: Optional[int] = None) -> dict:
     """
-    Evaluate a student answer against an expected answer.
+    Evaluate a student answer.
 
     Parameters
     ----------
-    expected_answer : str
-        Teacher's reference answer. May be empty — Gemini evaluates on its
-        own knowledge if the API key is set.
-    student_answer  : str
-        The student's submitted answer.
-    question_text   : str
-        The question text. Required when expected_answer is empty so Gemini
-        has context. Also helps the local pipeline's synonym/concept matching.
-    question_id     : int | None
-        If provided, expected_answer embedding is cached by this ID,
-        avoiding re-encoding for every student who answers the same question.
+    expected_answer : str  — teacher's reference answer (may be empty)
+    student_answer  : str  — student's submitted answer
+    question_text   : str  — question text (used for concept detection & Gemini)
+    question_id     : int  — enables embedding cache (skip re-encoding expected)
 
     Returns
     -------
-    dict with keys:
-        score              : int (0–10)
-        feedback           : str
-        key_points_covered : list[str]
-        key_points_missing : list[str]
-        breakdown          : dict (per-technique scores ×10)
-        used_gemini        : bool
-        no_expected_answer : bool
+    dict:  score (0–10), feedback, key_points_covered, key_points_missing,
+           breakdown, used_gemini, no_expected_answer
     """
     expected = (expected_answer or "").strip()
     student  = (student_answer  or "").strip()
+    question = (question_text   or "").strip()
 
-    # ── Fast-paths ────────────────────────────────────────────────────────────
+    # Fast paths
     if not student:
         return {
             "score": 0, "feedback": "No answer was submitted.",
@@ -1121,18 +1373,18 @@ def ai_evaluate(expected_answer: str, student_answer: str,
             "breakdown": {}, "used_gemini": False, "no_expected_answer": False,
         }
 
-    # ── Cache check ───────────────────────────────────────────────────────────
-    cache_raw = f"{expected}|||{student}|||{question_text}"
-    cache_key = hashlib.sha256(cache_raw.lower().strip().encode()).hexdigest()
+    # Result cache
+    cache_key = hashlib.sha256(
+        f"{expected}|||{student}|||{question}".lower().encode()
+    ).hexdigest()
     with _cache_lock:
         if cache_key in _eval_cache:
             return _eval_cache[cache_key]
 
-    # ── Route to correct pipeline ─────────────────────────────────────────────
-    if expected:
-        result = _evaluate_with_expected(expected, student, question_id)
-    else:
-        result = _evaluate_without_expected(student, question=question_text)
+    # Route
+    result = (_pipeline_with_expected(expected, student, question, question_id)
+              if expected
+              else _pipeline_without_expected(student, question))
 
     with _cache_lock:
         _eval_cache[cache_key] = result
@@ -1145,18 +1397,16 @@ def ai_evaluate_safe(expected_answer: str, student_answer: str,
                      question_id: Optional[int] = None,
                      fallback_score: Optional[int] = None) -> dict:
     """
-    Wrapper that NEVER raises. Always returns a valid result dict.
-    This is what admin.py should call — never call ai_evaluate() directly
-    from routes.
+    Never raises.  Always returns a valid result dict.
+    Use this in all Flask routes — never call ai_evaluate() directly.
     """
     try:
         return ai_evaluate(expected_answer, student_answer,
                            question_text, question_id)
     except Exception as e:
-        logger.error("ai_evaluate_safe unhandled error: %s", e)
-        score = fallback_score if fallback_score is not None else 0
+        logger.error("ai_evaluate_safe error: %s", e)
         return {
-            "score":              score,
+            "score":              fallback_score if fallback_score is not None else 0,
             "feedback":           "Evaluation service temporarily unavailable.",
             "key_points_covered": [],
             "key_points_missing": [],
