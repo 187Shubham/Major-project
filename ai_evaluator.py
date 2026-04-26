@@ -56,6 +56,21 @@ Fix C ─ Concept coverage not wired into with-expected pipeline
   Fix:     _evaluate_with_expected now calls _concept_coverage_score and uses
            the ratio as an additive floor on content_signal so a student who
            correctly names all required concepts cannot score below that floor.
+
+Fix D ─ "Explain" questions over-scored when concepts only listed, not explained
+  Problem: _concept_coverage awarded full credit whenever a keyword appeared
+           anywhere in the text — even if it was just listed in a comma-separated
+           enumeration.  "Abstraction, Encapsulation, Inheritance, Polymorphism
+           that help create modular code" scored 10/10 because all four keywords
+           were present.
+  Fix:     When the question contains an explain/describe/discuss/define trigger,
+           each concept is checked for an explanatory verb (is, means, allows,
+           hides, enables…) within 25 chars AFTER any of its occurrences in the
+           answer.  Checking ALL occurrences handles the "listed first, explained
+           later" pattern in the screenshot answer.  Listed-only earns 0.5 credit.
+           _detect_domain now picks the longest matching trigger (most specific
+           domain wins) so "class and object in OOP?" routes to oop_class_object,
+           not oop_pillars.
 """
 
 import os
@@ -497,62 +512,161 @@ DOMAIN_CONCEPTS: dict = {
 
 def _detect_domain(question: str) -> Optional[str]:
     """
-    Return the first matching domain key for this question, or None.
+    Return the best-matching domain key for this question, or None.
 
     Checks BOTH the raw lowercased question AND the normalised version
     (abbreviation-expanded) so that:
       • "OOP pillars"  → normalises to "object oriented programming pillars"
-        → matches "object oriented" trigger
-      • "what is class and object" → matches "class and object" trigger
-        in oop_class_object domain
+        → matches "four pillars" / "pillars" trigger in oop_pillars
+      • "What is class and object in OOP?" → raw matches "class and object"
+        trigger in oop_class_object (more specific → wins)
 
-    Priority: more-specific domains checked first (longer trigger phrases
-    match before single-word ones to avoid false positives).
+    Priority: among all domains that match, pick the one whose longest
+    matching trigger phrase is longest.  This ensures "class and object"
+    (15 chars) beats "object oriented" (15 chars, but oop_class_object
+    match via raw question is checked before OOP abbreviation expansion).
+    Ties broken by dict insertion order.
     """
     q_raw  = question.lower()
-    q_norm = normalise(question)   # abbreviation-expanded + compound-collapsed
+    q_norm = normalise(question)
 
-    # Check both raw and normalised to maximise recall
+    best_domain  = None
+    best_len     = -1
+
     for domain, cfg in DOMAIN_CONCEPTS.items():
-        triggers = cfg["triggers"]
-        if any(tw in q_raw for tw in triggers):
-            return domain
-        if any(tw in q_norm for tw in triggers):
-            return domain
-    return None
+        for tw in cfg["triggers"]:
+            if tw in q_raw or tw in q_norm:
+                if len(tw) > best_len:
+                    best_len    = len(tw)
+                    best_domain = domain
+
+    return best_domain
 
 
 def _concept_coverage(student: str, question: str) -> Tuple[float, List[str], List[str]]:
     """
     Check which required concepts the student's answer covers.
 
-    FIX A (multi-word matching):  We search for each synonym phrase in the
-    FULL normalised student text, not in a token set.  This means:
-      "real time entity" is in the text → matches synonym phrase → credit given
-      "inherit" is in text → matches synonym "inherit" → inheritance credited
+    Returns (coverage_ratio 0–1, covered_names, missing_names).
+    Returns (0.0, [], []) when no domain is detected.
 
-    Returns
-    -------
-    (coverage_ratio, covered_names, missing_names)
-    All empty / 0.0 when no domain detected.
+    Two modes:
+      • No explain trigger ("what is X"):  keyword PRESENCE is enough for full credit.
+      • Explain trigger ("explain X"):     each concept must be EXPLAINED (not just
+        listed) to earn full credit.  A concept earns 0.5 if listed-only, 1.0 if
+        an explanatory verb/phrase follows any of its occurrences within 25 chars.
+
+    Key implementation details
+    --------------------------
+    • Searches FULL normalised text (not token set) — fixes multi-word synonyms.
+    • Checks ALL occurrences of a keyword, not just the first — fixes the pattern
+      "listed first, explained later in the same answer".
+    • AFTER-only window — prevents a verb that precedes the keyword (e.g. "are"
+      before a comma-list) from counting as an explanation.
+    • Short explanation markers (≤5 chars) use whole-word regex to prevent "is"
+      matching inside "reusable", "this", etc.
+    • Window = 25 chars — wide enough to catch "abstraction this principle hides"
+      (screenshot pattern) but narrow enough to not cross sentence boundaries
+      after punctuation is stripped by normalise().
     """
+    import re as _re
+
     domain = _detect_domain(question)
     if not domain:
         return 0.0, [], []
 
-    concepts   = DOMAIN_CONCEPTS[domain]["concepts"]
-    stu_norm   = normalise(student)          # full string, not token set
+    concepts = DOMAIN_CONCEPTS[domain]["concepts"]
+    stu_norm = normalise(student)
+
+    # Detect whether the question demands explanation depth
+    _EXPLAIN_TRIGGERS = {"explain", "describe", "discuss", "elaborate", "define"}
+    requires_explanation = bool(set(normalise(question).split()) & _EXPLAIN_TRIGGERS)
+
+    # ---------------------------------------------------------------------------
+    # Explanation markers — verbs/phrases that signal a concept is being explained.
+    # Checked only in the text that FOLLOWS the keyword within 25 chars.
+    # "are" and "that" are intentionally excluded — they appear in bare list
+    # sentences ("...Abstraction, Encapsulation ... are important") and do not
+    # constitute an explanation of each individual concept.
+    # ---------------------------------------------------------------------------
+    _EXPLANATION_MARKERS = (
+        # Short whole-word markers (≤5 chars)
+        "is", "means", "hides", "wraps", "binds", "lets", "gives",
+        # Medium / long markers — substring match is safe (specific enough)
+        "refers to", "allows", "enables", "helps", "makes", "provides",
+        "prevents", "bundles", "restricts", "defines", "creates",
+        "represents", "ensures", "exposes", "focuses", "involves",
+        "means that", "is the ability", "is a mechanism", "is used",
+        "is when", "is the process", "is achieved", "is defined",
+        "for example", "such as",
+        # Concept-specific strong signals (always count regardless of position)
+        "multiple forms", "one interface", "many forms",
+        "compile time", "runtime", "overloading", "overriding",
+        "data hiding", "access control", "private", "getter", "setter",
+        "parent class", "child class", "subclass", "base class",
+        "abstract class", "interface", "abstract method",
+        "implementation detail", "internal detail",
+    )
+    _SHORT_MARKERS = frozenset(m for m in _EXPLANATION_MARKERS if len(m) <= 5)
+
+    def _explained_anywhere(text: str, keyword: str) -> bool:
+        """
+        Return True if `keyword` is followed by an explanatory marker within
+        25 chars at ANY of its occurrences in `text`.
+        Checking all occurrences handles the pattern:
+          "..., Abstraction, Encapsulation, ...  Abstraction is the process ..."
+        The first occurrence is listed; the second is explained — we credit it.
+        """
+        search_from = 0
+        while True:
+            pos = text.find(keyword, search_from)
+            if pos == -1:
+                return False
+            after = text[pos + len(keyword): pos + len(keyword) + 25]
+            for marker in _EXPLANATION_MARKERS:
+                if marker not in after:
+                    continue
+                if marker in _SHORT_MARKERS:
+                    if _re.search(r'(?<![a-z])' + _re.escape(marker) + r'(?![a-z])', after):
+                        return True
+                else:
+                    return True
+            search_from = pos + 1
+
     covered, missing = [], []
+    total_weight     = 0.0
+    covered_weight   = 0.0
 
     for concept in concepts:
-        name      = concept[0]              # display name
-        synonyms  = concept[1:]             # phrases to search for
+        name     = concept[0]
+        synonyms = concept[1:]
 
-        # Search each synonym phrase in the full normalised student text
-        found = any(syn in stu_norm for syn in synonyms)
-        (covered if found else missing).append(name)
+        # All synonyms that appear anywhere in the answer
+        found_syns = [s for s in synonyms if s in stu_norm]
 
-    ratio = len(covered) / max(1, len(concepts))
+        if not found_syns:
+            missing.append(name)
+            total_weight += 1.0
+
+        elif not requires_explanation:
+            # "What is X" style — presence is sufficient
+            covered.append(name)
+            total_weight   += 1.0
+            covered_weight += 1.0
+
+        else:
+            # "Explain X" style — need at least one synonym to be followed by
+            # an explanatory phrase at any of its occurrences
+            if any(_explained_anywhere(stu_norm, syn) for syn in found_syns):
+                covered.append(name)
+                total_weight   += 1.0
+                covered_weight += 1.0
+            else:
+                missing.append(f"{name} (listed only — needs explanation)")
+                total_weight   += 1.0
+                covered_weight += 0.5   # partial credit for mentioning it
+
+    ratio = covered_weight / max(1.0, total_weight)
     return ratio, covered, missing
 
 
@@ -1061,45 +1175,62 @@ def _to_score(content_signal: float) -> int:
 
 def _feedback(score: int, scores: dict, covered: list,
               missing: list, no_expected: bool) -> str:
-    """Build meaningful, metric-specific feedback when Gemini is absent."""
+    """Build meaningful, metric-specific feedback."""
     sem  = scores.get("semantic_sim",    0)
     kw   = scores.get("keyword_recall",  0)
     cov  = scores.get("concept_coverage",0)
     syn  = scores.get("synonym_match",   0)
 
-    cov_str = ", ".join(covered[:4]) if covered else None
-    mis_str = ", ".join(missing[:4]) if missing else None
+    # Separate "listed only" items from fully missing ones for clear feedback
+    listed_only = [m.replace(" (listed only — needs explanation)", "").strip()
+                   for m in missing if "listed only" in m]
+    truly_missing = [m for m in missing if "listed only" not in m]
+
+    cov_str  = ", ".join(covered[:4])     if covered       else None
+    mis_str  = ", ".join(truly_missing[:4]) if truly_missing else None
+    list_str = ", ".join(listed_only[:4]) if listed_only   else None
+
+    # Build listed-only note — this is the key feedback for Q2-style answers
+    listed_note = ""
+    if listed_only:
+        listed_note = (f"You mentioned {list_str} but did not explain "
+                       f"{'them' if len(listed_only) > 1 else 'it'} — "
+                       f"write a sentence explaining each concept to improve your score. ")
 
     if score == 10:
-        return ("Perfect — all key concepts covered with accuracy. "
-                "The meaning aligns completely with the expected answer.")
+        return ("Perfect — all key concepts explained with accuracy. "
+                "The answer is comprehensive and complete.")
     if score >= 8:
         msg = (f"Strong answer — semantic similarity {int(sem*100)}%, "
                f"concept coverage {int(cov*100)}%. ")
-        return msg + (f"Minor gaps: {mis_str}." if mis_str
-                      else "Only minor elaboration could improve this.")
-    if score >= 6:
-        msg = f"Good — main idea present (semantic: {int(sem*100)}%). "
-        if cov_str:
-            msg += f"Correctly addressed: {cov_str}. "
+        msg += listed_note
         if mis_str:
-            msg += f"Key concepts missing: {mis_str}."
+            msg += f"Missing: {mis_str}."
+        if not listed_note and not mis_str:
+            msg += "Only minor elaboration could improve this."
+        return msg
+    if score >= 6:
+        msg = f"Partially complete. "
+        if cov_str:
+            msg += f"Well explained: {cov_str}. "
+        msg += listed_note
+        if mis_str:
+            msg += f"Not mentioned: {mis_str}."
         return msg
     if score >= 4:
-        msg = f"Partial (concept coverage: {int(cov*100)}%, synonym match: {int(syn*100)}%). "
+        msg = f"Incomplete answer (concept coverage: {int(cov*100)}%). "
+        msg += listed_note
         if cov_str:
-            msg += f"You covered: {cov_str}. "
+            msg += f"Covered: {cov_str}. "
         if mis_str:
             msg += f"Missing: {mis_str}."
         return msg
     if score >= 2:
-        return (f"Weak — limited relevant content "
-                f"(keyword recall: {int(kw*100)}%). "
-                + (f"Missing concepts: {mis_str}. " if mis_str else "")
-                + "Include specific terminology from the topic.")
+        return (f"Weak — limited relevant content (keyword recall: {int(kw*100)}%). "
+                + (f"Missing: {mis_str}. " if mis_str else "")
+                + "Include specific terminology and explanations.")
     if score == 1:
-        return ("The answer barely touches the topic. "
-                "Review the material and include key definitions.")
+        return "The answer barely touches the topic. Review the material and include key definitions."
     return ("No answer submitted." if not no_expected
             else "No answer submitted, or entirely off-topic.")
 
@@ -1137,12 +1268,10 @@ def _pipeline_with_expected(expected: str, student: str,
     gem = _gemini_evaluate(expected, student, question)
     if gem:
         scores["gemini"] = gem["score"]
-        feedback  = gem.get("feedback", "")
-        # Merge Gemini's covered/missing with local concept detection
-        if gem.get("covered"):
-            covered = gem["covered"]
-        if gem.get("missing"):
-            missing = gem["missing"]
+        feedback    = gem.get("feedback", "")
+        # NOTE: do NOT override covered/missing from Gemini here.
+        # Local _concept_coverage (already run above) is authoritative for
+        # explanation-depth (FIX D).  Gemini does not detect listed-vs-explained.
         used_gemini = True
         weights = _W_GEMINI
     else:
@@ -1151,28 +1280,27 @@ def _pipeline_with_expected(expected: str, student: str,
     # ── Weighted fusion ───────────────────────────────────────────────────
     raw_signal = sum(scores.get(k, 0) * w for k, w in weights.items())
 
-    # ── concept_coverage FLOOR ───────────────────────────────────────────────
-    # Guarantees minimum signal when student covers required concepts.
-    # Scaled by how many concepts the domain requires:
-    #   coverage_ratio=1.0  → floor=0.80 → score ≥ 9   (all concepts present)
-    #   coverage_ratio=0.67 → floor=0.54 → score ≥ 6   (2/3 concepts)
-    #   coverage_ratio=0.50 → floor=0.40 → score ≥ 5   (half concepts)
-    #   coverage_ratio=0.0  → floor=0.0  → no boost     (no domain detected)
-    # Cap at 0.82 so concept coverage alone cannot give 10 — explanation quality
-    # (semantic/synonym) must contribute the final push to 10.
-    # Floor logic:
-    #   3/3 concepts covered → floor = 0.72 → score ≥ 8
-    #   2/3 concepts covered → floor = 0.48 → score ≥ 5
-    #   1/3 concepts covered → floor = 0.24 → score ≥ 3
-    # Score 9-10 requires BOTH concept floor AND high semantic/synonym quality.
-    # Cap at 0.75 so explanation depth (semantic, synonym) must contribute the
-    # final push — prevents shallow but keyword-complete answers from hitting 9.
-    concept_floor  = min(0.75, coverage_ratio * 0.72)
-    content_signal = max(raw_signal, concept_floor)
+    # ── concept_coverage FLOOR + CEILING ─────────────────────────────────
+    # FLOOR: guarantees minimum score when student covers required concepts.
+    # CEILING: prevents Gemini from inflating score when concepts were only
+    #          listed and not explained (FIX D enforcement).
+    #   ratio=1.0  (all explained)    → floor=0.72  ceiling=1.0  (no cap)
+    #   ratio=0.625 (1/4 explained)  → floor=0.45  ceiling=0.69 → score ≤ 7
+    #   ratio=0.5  (none explained)  → floor=0.36  ceiling=0.55 → score ≤ 6
+    #   ratio=0.0  (no domain)       → no floor/ceiling
+    if coverage_ratio > 0.0:
+        concept_floor   = min(0.75, coverage_ratio * 0.72)
+        concept_ceiling = min(1.0,  coverage_ratio * 1.10)
+        content_signal  = max(min(raw_signal, concept_ceiling), concept_floor)
+    else:
+        content_signal = raw_signal
 
     final_score = _to_score(content_signal)
 
-    if not feedback:
+    # If local concept check found explanation gaps, override Gemini feedback
+    # so the student sees actionable info about what was listed vs explained.
+    has_listed_only = any("listed only" in str(m) for m in missing)
+    if has_listed_only or not feedback:
         feedback = _feedback(final_score, scores, covered, missing, no_expected=False)
 
     logger.info(
@@ -1211,14 +1339,37 @@ def _pipeline_without_expected(student: str, question: str = "") -> dict:
         missing   = gem.get("missing", [])
         feedback  = gem.get("feedback", "")
 
-        final_score = max(1, min(9, round(gem_score * 10)))
+        gem_int = max(1, min(9, round(gem_score * 10)))
         if gem_score < 0.05:
-            final_score = 0
+            gem_int = 0
 
-        if not feedback:
+        # Always run local concept_coverage so FIX D (explanation depth) is
+        # enforced even when Gemini is available.  Gemini grades on keyword
+        # presence and general fluency — it does NOT penalise "listed but not
+        # explained".  Local coverage is the authoritative ceiling for that.
+        cov_ratio, cov_list, mis_list = _concept_coverage(student, question)
+
+        if cov_ratio > 0.0:
+            # FLOOR: student covered some concepts → guarantee a minimum score
+            floor_score = _to_score(min(0.75, cov_ratio * 0.72))
+            # CEILING: explanation depth caps the max score.
+            #   ratio=1.0 (all explained)   → ceiling=10  (no cap)
+            #   ratio=0.625 (1/4 explained) → ceiling=7
+            #   ratio=0.500 (none explained)→ ceiling=6
+            ceiling_score = _to_score(min(1.0, cov_ratio * 1.10))
+            final_score   = max(floor_score, min(gem_int, ceiling_score))
+            # Always trust local lists for explanation-depth accuracy
+            covered = cov_list if cov_list else covered
+            missing = mis_list if mis_list else missing
+        else:
+            cov_ratio   = 0.0
+            final_score = gem_int
+
+        # Build feedback — always mention what was listed-only if any
+        if not feedback or (mis_list and "listed only" in str(mis_list)):
             feedback = _feedback(
                 final_score,
-                {"semantic_sim": gem_score, "concept_coverage": gem_score,
+                {"semantic_sim": gem_score, "concept_coverage": cov_ratio,
                  "keyword_recall": gem_score, "synonym_match": gem_score},
                 covered, missing, no_expected=True,
             )
@@ -1228,7 +1379,8 @@ def _pipeline_without_expected(student: str, question: str = "") -> dict:
             "feedback":           feedback,
             "key_points_covered": covered,
             "key_points_missing": missing,
-            "breakdown":          {"gemini": round(gem_score * 10, 2)},
+            "breakdown":          {"gemini": round(gem_score * 10, 2),
+                                   "concept_coverage": round(cov_ratio * 10, 2)},
             "used_gemini":        True,
             "no_expected_answer": True,
         }
@@ -1265,16 +1417,14 @@ def _pipeline_without_expected(student: str, question: str = "") -> dict:
         final_score     = _to_score(min(0.72, content_quality))
         final_score     = max(1, min(7, final_score))
 
-    # Feedback
+    # Feedback — route through _feedback() so listed-only note is included
     if domain_detected:
-        if missing:
-            cov_str = ", ".join(covered)
-            mis_str = ", ".join(missing)
-            feedback = (f"Good coverage — you addressed: {cov_str}. "
-                        f"Missing: {mis_str}. Adding these would improve your score.")
-        else:
-            feedback = (f"Excellent — all required concepts covered: {', '.join(covered)}. "
-                        f"Your answer is comprehensive.")
+        feedback = _feedback(
+            final_score,
+            {"semantic_sim": 0, "concept_coverage": coverage_ratio,
+             "keyword_recall": 0, "synonym_match": 0},
+            covered, missing, no_expected=True,
+        )
     else:
         feedback = (
             f"No expected answer on file. Evaluated on content richness "
